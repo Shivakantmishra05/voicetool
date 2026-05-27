@@ -1,0 +1,51 @@
+body {
+  background: #f6f8fb;
+  color: #18212f;
+}
+
+.metric {
+  background: #fff;
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  padding: 14px 16px;
+  min-height: 92px;
+}
+
+.metric span {
+  color: #617089;
+  display: block;
+  font-size: 0.84rem;
+}
+
+.metric strong {
+  display: block;
+  font-size: 1.8rem;
+  margin-top: 10px;
+}
+
+.summary {
+  min-width: 280px;
+  max-width: 520px;
+}
+
+.login-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+}
+
+.login-shell {
+  width: min(420px, calc(100vw - 32px));
+}
+
+.login-panel {
+  background: #fff;
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  padding: 24px;
+}
+
+.login-panel h1 {
+  font-size: 1.25rem;
+  margin-bottom: 20px;
+}

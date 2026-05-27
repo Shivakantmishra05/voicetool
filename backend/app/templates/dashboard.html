@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DreamHome Voice Ops</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="/static/dashboard.css" rel="stylesheet">
+  </head>
+  <body>
+    <nav class="navbar navbar-expand-lg bg-white border-bottom">
+      <div class="container-fluid">
+        <span class="navbar-brand fw-semibold">DreamHome Voice Ops</span>
+        <div class="d-flex gap-2">
+          <a class="btn btn-sm btn-outline-primary" href="/calls/export.csv">Export CSV</a>
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ request.cookies.get('dh_csrf', '') }}">
+            <button class="btn btn-sm btn-outline-secondary" type="submit">Sign out</button>
+          </form>
+        </div>
+      </div>
+    </nav>
+    <main class="container-fluid py-4">
+      <div class="row g-3 mb-4">
+        <div class="col-md"><div class="metric"><span>Total calls</span><strong>{{ stats.total_calls }}</strong></div></div>
+        <div class="col-md"><div class="metric"><span>Active calls</span><strong>{{ stats.active_calls }}</strong></div></div>
+        <div class="col-md"><div class="metric"><span>Avg duration</span><strong>{{ stats.avg_duration }}s</strong></div></div>
+        <div class="col-md"><div class="metric"><span>Conversion</span><strong>{{ stats.lead_conversion }}%</strong></div></div>
+        <div class="col-md"><div class="metric"><span>Booked visits</span><strong>{{ stats.booked_visits }}</strong></div></div>
+      </div>
+      <section class="table-responsive bg-white border">
+        <table class="table table-hover align-middle mb-0">
+          <thead>
+            <tr>
+              <th>Time</th><th>Caller</th><th>Status</th><th>Lead</th><th>Duration</th><th>Sentiment</th><th>Summary</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for call in calls %}
+            <tr>
+              <td>{{ call.created_at.strftime('%Y-%m-%d %H:%M') if call.created_at else '' }}</td>
+              <td>{{ call.caller_number|mask_phone }}<div class="text-muted small">{{ call.call_sid }}</div></td>
+              <td><span class="badge text-bg-light">{{ call.status.value }}</span></td>
+              <td><span class="badge text-bg-primary">{{ call.lead_status.value }}</span></td>
+              <td>{{ call.duration_seconds or 0 }}s</td>
+              <td>{{ call.sentiment or '-' }}</td>
+              <td class="summary">{{ call.summary or '-' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+    </main>
+  </body>
+</html>
