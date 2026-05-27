@@ -2,6 +2,7 @@ import asyncio
 import base64
 import contextlib
 import json
+from typing import Any
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
@@ -13,7 +14,9 @@ from app.models import Call
 from app.prompts.real_estate_agent import SYSTEM_PROMPT
 from app.observability import Metrics
 from app.services.call_repository import CallRepository
+from app.services.call_summary import CallSummarizer
 from app.services.memory import ConversationMemory, ConversationState
+from app.services.supabase_crm import SupabaseCRM
 from app.telephony.stream_auth import StreamClaims, StreamTokenService
 from app.utils.logging import call_sid_ctx, log
 
@@ -31,6 +34,8 @@ class TwilioMediaSession:
         stream_tokens: StreamTokenService,
         claims: StreamClaims,
         metrics: Metrics,
+        summarizer: CallSummarizer,
+        crm: SupabaseCRM,
     ):
         self.websocket = websocket
         self.settings = settings
@@ -38,6 +43,8 @@ class TwilioMediaSession:
         self.stream_tokens = stream_tokens
         self.claims = claims
         self.metrics = metrics
+        self.summarizer = summarizer
+        self.crm = crm
 
         self.state: ConversationState | None = None
         self.call: Call | None = None
@@ -45,6 +52,8 @@ class TwilioMediaSession:
         self.tasks: set[asyncio.Task] = set()
         self.started = False
         self.stopping = False
+        self.transcript_turns: list[dict[str, str]] = []
+        self.assistant_transcript_parts: dict[str, list[str]] = {}
 
     async def run(self) -> None:
         await self.websocket.accept()
@@ -131,6 +140,7 @@ class TwilioMediaSession:
                     "audio": {
                         "input": {
                             "format": {"type": "audio/pcmu"},
+                            "transcription": {"model": self.settings.openai_transcription_model},
                             "turn_detection": {
                                 "type": "server_vad",
                                 "threshold": 0.55,
@@ -209,6 +219,20 @@ class TwilioMediaSession:
         if event_type in {"response.audio.delta", "response.output_audio.delta"}:
             await self._send_twilio_audio(event.get("delta"))
             return
+        if event_type in {"conversation.item.input_audio_transcription.completed", "input_audio_transcription.completed"}:
+            self._add_transcript_turn("user", event.get("transcript"))
+            return
+        if event_type in {"response.audio_transcript.delta", "response.output_audio_transcript.delta"}:
+            response_id = event.get("response_id") or "active"
+            delta = event.get("delta")
+            if delta:
+                self.assistant_transcript_parts.setdefault(response_id, []).append(str(delta))
+            return
+        if event_type in {"response.audio_transcript.done", "response.output_audio_transcript.done"}:
+            response_id = event.get("response_id") or "active"
+            transcript = event.get("transcript") or "".join(self.assistant_transcript_parts.pop(response_id, []))
+            self._add_transcript_turn("assistant", transcript)
+            return
         if event_type in {"response.audio.done", "response.output_audio.done"}:
             log.info("openai_response_audio_done", response_id=event.get("response_id"))
             await self._send_twilio_mark(event.get("response_id") or "openai-response")
@@ -251,13 +275,60 @@ class TwilioMediaSession:
         self.stopping = True
         await self._close_openai()
         if self.state:
+            summary = await self._summarize_and_persist_call()
             async with SessionLocal() as session:
                 repo = CallRepository(session)
                 call = await repo.get_by_sid(self.state.call_sid)
                 if call:
-                    await repo.finish_call(call, None, failure_reason)
+                    await repo.finish_call(call, summary, failure_reason)
             await self.memory.delete(self.state.call_sid)
         log.info("call_finished", failure_reason=failure_reason)
+
+    async def _summarize_and_persist_call(self) -> dict[str, Any] | None:
+        if not self.state:
+            return None
+        transcript = self._full_transcript()
+        log.info("call_completion_started", transcript_chars=len(transcript), transcript_turns=len(self.transcript_turns))
+        summary = await self.summarizer.summarize(transcript)
+        payload = self._crm_payload(summary, transcript)
+        await self.crm.insert_call(payload)
+        log.info("call_completion_saved", lead_status=summary.get("lead_status"))
+        return summary
+
+    def _add_transcript_turn(self, role: str, text: str | None) -> None:
+        cleaned = " ".join(str(text or "").split())
+        if not cleaned:
+            return
+        self.transcript_turns.append({"role": role, "text": cleaned})
+        log.info("transcript_accumulated", role=role, chars=len(cleaned), turns=len(self.transcript_turns))
+
+    def _full_transcript(self) -> str:
+        lines = [f"{turn['role'].title()}: {turn['text']}" for turn in self.transcript_turns]
+        transcript = "\n".join(lines)
+        if len(transcript) > self.settings.max_transcript_chars:
+            return transcript[-self.settings.max_transcript_chars :]
+        return transcript
+
+    def _crm_payload(self, summary: dict[str, Any], transcript: str) -> dict[str, Any]:
+        lead_info = summary.get("lead_info") or {}
+        return {
+            "call_sid": self.state.call_sid if self.state else self.claims.call_sid,
+            "phone_number": self.state.caller_number if self.state else None,
+            "caller_name": _text_or_none(lead_info.get("name")),
+            "pg_for": _text_or_none(lead_info.get("pg_for")),
+            "sharing_preference": _text_or_none(lead_info.get("sharing_preference")),
+            "budget": _text_or_none(lead_info.get("budget")),
+            "move_in_date": _text_or_none(lead_info.get("move_in_date")),
+            "occupation": _text_or_none(lead_info.get("occupation")),
+            "whatsapp_confirmation": _bool_or_none(lead_info.get("whatsapp_confirmation")),
+            "visit_interest": _text_or_none(lead_info.get("visit_interest")),
+            "lead_status": summary.get("lead_status") or "needs_follow_up",
+            "sentiment": _text_or_none(summary.get("sentiment")),
+            "outcome": _text_or_none(summary.get("outcome")),
+            "objections": _text_or_none(_serialize_text(lead_info.get("objections"))),
+            "summary": _text_or_none(summary.get("summary")),
+            "full_transcript": transcript,
+        }
 
     async def _close_openai(self) -> None:
         if self.openai_ws:
@@ -299,3 +370,33 @@ def _realtime_instructions() -> str:
         + "- Do not repeat the same question if the user already answered.\n"
         + "- If audio is unclear, ask one short clarification.\n"
     )
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"yes", "true", "haan", "ha", "ji", "confirmed"}:
+        return True
+    if text in {"no", "false", "nahi", "nahin", "not confirmed"}:
+        return False
+    return None
+
+
+def _serialize_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return ", ".join(str(item).strip() for item in value if str(item).strip()) or None
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)

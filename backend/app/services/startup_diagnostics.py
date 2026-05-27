@@ -42,6 +42,7 @@ async def run_startup_diagnostics(settings: Settings, memory: ConversationMemory
         provider_checks = await asyncio.gather(
             _check_twilio(settings),
             _check_openai(settings),
+            _check_supabase(settings),
         )
         checks.extend(provider_checks)
     diagnostics = StartupDiagnostics(environment=settings.environment, checks=checks)
@@ -83,6 +84,21 @@ async def _check_openai(settings: Settings) -> ProviderCheck:
             response.raise_for_status()
 
     return await _timed("openai", run, settings.provider_check_timeout_seconds)
+
+
+async def _check_supabase(settings: Settings) -> ProviderCheck:
+    if not settings.supabase_url or not settings.supabase_key:
+        return ProviderCheck("supabase", "skipped", detail="SUPABASE_URL or SUPABASE_KEY not configured")
+
+    async def run():
+        async with httpx.AsyncClient(timeout=settings.provider_check_timeout_seconds) as client:
+            response = await client.get(
+                f"{str(settings.supabase_url).rstrip('/')}/rest/v1/calls?select=id&limit=1",
+                headers={"apikey": settings.supabase_key, "Authorization": f"Bearer {settings.supabase_key}"},
+            )
+            response.raise_for_status()
+
+    return await _timed("supabase", run, settings.provider_check_timeout_seconds)
 
 
 async def _timed(name: str, operation, timeout: float | None = None) -> ProviderCheck:

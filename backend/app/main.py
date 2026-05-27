@@ -4,14 +4,16 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import dashboard, health, twilio
+from app.api import dashboard, health, leads, twilio
 from app.config import get_settings
 from app.database.init_db import init_db
 from app.middleware.request_context import InMemoryRateLimitMiddleware, RequestContextMiddleware
 from app.observability import Metrics
 from app.database.session import SessionLocal
 from app.services.memory import ConversationMemory
+from app.services.call_summary import CallSummarizer
 from app.services.startup_diagnostics import run_startup_diagnostics
+from app.services.supabase_crm import SupabaseCRM
 from app.telephony.stream_auth import StreamTokenService
 from app.telephony.stream_auth import StreamTokenError
 from app.utils.logging import configure_logging
@@ -32,6 +34,8 @@ async def lifespan(app: FastAPI):
     app.state.metrics = Metrics()
     app.state.memory = memory
     app.state.stream_tokens = StreamTokenService(settings, memory)
+    app.state.summarizer = CallSummarizer(settings)
+    app.state.crm = SupabaseCRM(settings)
     async with SessionLocal() as session:
         app.state.startup_diagnostics = await run_startup_diagnostics(settings, memory, session)
     yield
@@ -52,6 +56,7 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 app.include_router(health.router)
 app.include_router(twilio.router)
 app.include_router(dashboard.router)
+app.include_router(leads.router)
 
 
 async def _twilio_media_authenticated(websocket: WebSocket, stream_token: str | None):
@@ -93,6 +98,8 @@ async def _twilio_media_authenticated(websocket: WebSocket, stream_token: str | 
         app.state.stream_tokens,
         claims,
         app.state.metrics,
+        app.state.summarizer,
+        app.state.crm,
     )
     await session.run()
 

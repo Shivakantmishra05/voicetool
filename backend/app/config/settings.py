@@ -27,6 +27,11 @@ class Settings(BaseSettings):
 
     openai_api_key: str
     openai_realtime_model: str = "gpt-realtime"
+    openai_summary_model: str = "gpt-4.1-mini"
+    openai_transcription_model: str = "gpt-4o-mini-transcribe"
+
+    supabase_url: AnyHttpUrl | None = None
+    supabase_key: str | None = None
 
     deepgram_api_key: str | None = None
     deepgram_model: str = "nova-3"
