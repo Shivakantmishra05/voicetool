@@ -327,7 +327,7 @@ class TwilioMediaSession:
                             },
                         },
                         "output": {
-                            "format": {"type": "audio/pcmu"},
+                            "format": {"type": "audio/pcm", "rate": 24000},
                             "voice": self.settings.openai_realtime_voice,
                             "speed": self.settings.openai_realtime_speed,
                         },
@@ -522,6 +522,19 @@ class TwilioMediaSession:
             return
         sent_count = 0
         for safe_payload in payloads:
+            if self.twilio_media_sent_count == 0 and sent_count == 0:
+                try:
+                    twilio_bytes = len(base64.b64decode(safe_payload, validate=True))
+                except Exception:
+                    twilio_bytes = None
+                log.info(
+                    "twilio_audio_first_payload",
+                    response_id=response_id,
+                    bytes=twilio_bytes,
+                    source_format=self.openai_output_audio_format,
+                    source_rate=self.openai_output_audio_rate,
+                    transcoded=self.openai_output_audio_format == "audio/pcm",
+                )
             if self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": safe_payload}}, "audio"):
                 sent_count += 1
         if sent_count == 0:
@@ -559,6 +572,7 @@ class TwilioMediaSession:
         rate = audio_format.get("rate")
         self.openai_output_audio_rate = int(rate) if str(rate or "").isdigit() else None
         if self.openai_output_audio_format == "audio/pcm":
+            self.openai_output_audio_rate = self.openai_output_audio_rate or 24000
             self.openai_pcm_transcoder = Pcm16ToUlaw8kTranscoder(input_sample_rate=self.openai_output_audio_rate or 24000)
         else:
             self.openai_pcm_transcoder = None
