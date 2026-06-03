@@ -1,0 +1,81 @@
+services:
+  - type: web
+    name: dreamhome-voice-api
+    runtime: docker
+    plan: starter
+    region: singapore
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /ready
+    autoDeployTrigger: commit
+    envVars:
+      - key: ENVIRONMENT
+        value: staging
+      - key: PUBLIC_BASE_URL
+        value: https://dreamhome-voice-api.onrender.com
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CORS_ORIGINS
+        value: https://dreamhome-voice-api.onrender.com
+      - key: DATABASE_URL
+        fromDatabase:
+          name: dreamhome-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: dreamhome-redis
+          property: connectionString
+      - key: REQUIRE_REDIS
+        value: "true"
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: STREAM_TOKEN_SECRET
+        generateValue: true
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_REALTIME_MODEL
+        value: gpt-realtime
+      - key: OPENAI_SUMMARY_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_TRANSCRIPTION_MODEL
+        value: gpt-4o-mini-transcribe
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_SESSION_SECRET
+        generateValue: true
+      - key: STARTUP_PROVIDER_CHECKS_ENABLED
+        value: "true"
+      - key: STARTUP_PROVIDER_CHECKS_REQUIRED
+        value: "false"
+      - key: PROVIDER_CHECK_TIMEOUT_SECONDS
+        value: "8"
+      - key: MAX_MEMORY_TURNS
+        value: "40"
+      - key: MAX_TRANSCRIPT_CHARS
+        value: "32000"
+
+  - type: keyvalue
+    name: dreamhome-redis
+    plan: free
+    region: singapore
+    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru
+
+databases:
+  - name: dreamhome-postgres
+    plan: free
+    region: singapore
+    postgresMajorVersion: "16"
+    databaseName: dreamhome
+    user: dreamhome

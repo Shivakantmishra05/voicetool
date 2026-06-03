@@ -91,7 +91,7 @@ class GeminiLLM:
         return await retry_async(run, attempts=2)
 
     def fallback_response(self) -> str:
-        return "Ji sir, Udaan Residency me boys aur girls PG available hai. Aap double sharing chahenge ya triple?"
+        return "Ji sir, DreamHome Properties me 2 BHK aur 3 BHK options available hain. Aapka approximate budget kya rahega?"
 
     def _clean_phone_text(self, text: str) -> str:
         text = " ".join(text.replace("\n", " ").split())

@@ -1,7 +1,11 @@
 import asyncio
 import base64
 import contextlib
+import inspect
 import json
+from collections import deque
+from enum import StrEnum
+from time import monotonic
 from typing import Any
 
 import websockets
@@ -9,12 +13,24 @@ from fastapi import WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 
 from app.config import Settings
+from app.conversation.anti_repetition import can_ask, infer_asked_field, record_question
+from app.conversation.customer_profile import classify_customer_profile_with_confidence, get_profile_context
+from app.conversation.fact_extractor import extract_customer_facts
+from app.conversation.language_manager import detect_language_update, get_language_context
+from app.conversation.lead_scoring import calculate_lead_score, get_lead_score_context
+from app.conversation.memory_manager import CallMemoryManager, build_memory_context
+from app.conversation.objection_detector import detect_objections, get_objection_context, merge_objections
+import app.conversation.persona as persona_module
+from app.conversation.persona import get_persona_context
+from app.conversation.quality_metrics import assistant_turn_metrics, user_turn_metrics
+from app.conversation.stage_manager import determine_stage_with_reason, get_stage_context
 from app.database.session import SessionLocal
 from app.models import Call
-from app.prompts.real_estate_agent import SYSTEM_PROMPT
+from app.prompts.real_estate_agent import SYSTEM_PROMPT, build_dynamic_response_context
 from app.observability import Metrics
 from app.services.call_repository import CallRepository
 from app.services.call_summary import CallSummarizer
+from app.services.crm_outbox import CRMOutbox
 from app.services.memory import ConversationMemory, ConversationState
 from app.services.supabase_crm import SupabaseCRM
 from app.telephony.stream_auth import StreamClaims, StreamTokenService
@@ -22,7 +38,53 @@ from app.utils.logging import call_sid_ctx, log
 
 
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
-GREETING = "Hello, Udaan Residency PG Indirapuram se bol raha hu. Aap boys PG dekh rahe hain ya girls PG?"
+GREETING = "Namaste sir, main Riya Sharma DreamHome Properties se bol rahi hoon. Aap flat dekh rahe hain?"
+GREETING_LOCK_SECONDS = 2.5
+BARGE_IN_DEBOUNCE_SECONDS = 0.3
+RESPONSE_AUDIO_TIMEOUT_SECONDS = 2.0
+SILENCE_PROMPT_SECONDS = 10.0
+OPENAI_CONNECT_TIMEOUT_SECONDS = 3.5
+SESSION_UPDATE_ACK_TIMEOUT_SECONDS = 2.0
+EARLY_AUDIO_BUFFER_FRAMES = 300
+TWILIO_OUTBOUND_QUEUE_SIZE = 1000
+OPENAI_HEARTBEAT_SECONDS = 20.0
+OPENAI_PONG_TIMEOUT_SECONDS = 10.0
+OPENAI_RECONNECT_ATTEMPTS = 1
+
+
+class CallPhase(StrEnum):
+    NEW = "NEW"
+    TWILIO_CONNECTED = "TWILIO_CONNECTED"
+    STREAM_STARTED = "STREAM_STARTED"
+    OPENAI_CONNECTING = "OPENAI_CONNECTING"
+    OPENAI_CONNECTED = "OPENAI_CONNECTED"
+    SESSION_UPDATING = "SESSION_UPDATING"
+    SESSION_READY = "SESSION_READY"
+    WAITING_FOR_USER = "WAITING_FOR_USER"
+    USER_SPEAKING = "USER_SPEAKING"
+    PROCESSING_USER = "PROCESSING_USER"
+    ASSISTANT_SPEAKING = "ASSISTANT_SPEAKING"
+    CALL_ENDING = "CALL_ENDING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+ALLOWED_PHASE_TRANSITIONS: dict[CallPhase, set[CallPhase]] = {
+    CallPhase.NEW: {CallPhase.TWILIO_CONNECTED, CallPhase.FAILED},
+    CallPhase.TWILIO_CONNECTED: {CallPhase.STREAM_STARTED, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.STREAM_STARTED: {CallPhase.OPENAI_CONNECTING, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.OPENAI_CONNECTING: {CallPhase.OPENAI_CONNECTED, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.OPENAI_CONNECTED: {CallPhase.SESSION_UPDATING, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.SESSION_UPDATING: {CallPhase.SESSION_READY, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.SESSION_READY: {CallPhase.OPENAI_CONNECTING, CallPhase.ASSISTANT_SPEAKING, CallPhase.USER_SPEAKING, CallPhase.WAITING_FOR_USER, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.WAITING_FOR_USER: {CallPhase.OPENAI_CONNECTING, CallPhase.USER_SPEAKING, CallPhase.PROCESSING_USER, CallPhase.ASSISTANT_SPEAKING, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.USER_SPEAKING: {CallPhase.OPENAI_CONNECTING, CallPhase.PROCESSING_USER, CallPhase.ASSISTANT_SPEAKING, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.PROCESSING_USER: {CallPhase.OPENAI_CONNECTING, CallPhase.ASSISTANT_SPEAKING, CallPhase.WAITING_FOR_USER, CallPhase.USER_SPEAKING, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.ASSISTANT_SPEAKING: {CallPhase.WAITING_FOR_USER, CallPhase.USER_SPEAKING, CallPhase.PROCESSING_USER, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.CALL_ENDING: {CallPhase.COMPLETED, CallPhase.FAILED},
+    CallPhase.COMPLETED: set(),
+    CallPhase.FAILED: set(),
+}
 
 
 class TwilioMediaSession:
@@ -36,6 +98,7 @@ class TwilioMediaSession:
         metrics: Metrics,
         summarizer: CallSummarizer,
         crm: SupabaseCRM,
+        crm_outbox: CRMOutbox,
     ):
         self.websocket = websocket
         self.settings = settings
@@ -45,6 +108,8 @@ class TwilioMediaSession:
         self.metrics = metrics
         self.summarizer = summarizer
         self.crm = crm
+        self.crm_outbox = crm_outbox
+        self.call_memory = CallMemoryManager(memory.redis)
 
         self.state: ConversationState | None = None
         self.call: Call | None = None
@@ -54,10 +119,53 @@ class TwilioMediaSession:
         self.stopping = False
         self.transcript_turns: list[dict[str, str]] = []
         self.assistant_transcript_parts: dict[str, list[str]] = {}
+        self.greeting_clear_locked_until = 0.0
+        self.greeting_response_id: str | None = None
+        self.greeting_completed = False
+        self.assistant_response_active = False
+        self.assistant_speaking = False
+        self.current_response_id: str | None = None
+        self.response_started_at: float | None = None
+        self.response_completed_at: float | None = None
+        self.response_first_audio_at: float | None = None
+        self.response_audio_sent_counts: dict[str, int] = {}
+        self.twilio_media_sent_count = 0
+        self.pending_marks: set[str] = set()
+        self.mark_response_ids: dict[str, str] = {}
+        self.caller_speaking = False
+        self.caller_speech_started_at: float | None = None
+        self.last_activity_at = monotonic()
+        self.last_assistant_audio_at = 0.0
+        self._barge_in_task: asyncio.Task | None = None
+        self.customer_memory: dict[str, Any] = {}
+        self.call_started_at: float | None = None
+        self.openai_connect_started_at: float | None = None
+        self.openai_tcp_connected_at: float | None = None
+        self.openai_ws_connected_at: float | None = None
+        self.openai_connected_at: float | None = None
+        self.session_update_sent_at: float | None = None
+        self.session_update_ack_at: float | None = None
+        self.session_updated_at: float | None = None
+        self.response_create_sent_at: float | None = None
+        self.greeting_response_create_at: float | None = None
+        self.first_audio_delta_at: float | None = None
+        self.deferred_response_instructions: str | None = None
+        self.deferred_response_reason: str | None = None
+        self.session_update_ack_event = asyncio.Event()
+        self.openai_ready = False
+        self.early_audio_frames: deque[str] = deque(maxlen=EARLY_AUDIO_BUFFER_FRAMES)
+        self.twilio_outbound_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=TWILIO_OUTBOUND_QUEUE_SIZE)
+        self.openai_reconnect_attempts = 0
+        self.openai_connect_task: asyncio.Task | None = None
+        self.openai_recovering = False
+        self._transcript_lock = asyncio.Lock()
+        self.phase = CallPhase.NEW
 
     async def run(self) -> None:
         await self.websocket.accept()
+        self._transition(CallPhase.TWILIO_CONNECTED, "twilio_websocket_accepted")
         self.metrics.inc("voice_ws_connected_total")
+        self._spawn(self._twilio_sender_loop(), "twilio_outbound_sender")
         try:
             await self._twilio_loop()
         except (WebSocketDisconnect, asyncio.TimeoutError):
@@ -84,7 +192,7 @@ class TwilioMediaSession:
         elif event == "media":
             await self._media(message)
         elif event == "mark":
-            log.debug("twilio_mark_ack", mark_name=(message.get("mark") or {}).get("name"))
+            await self._handle_twilio_mark(message)
         elif event == "stop":
             await self._stop()
 
@@ -101,41 +209,100 @@ class TwilioMediaSession:
         self._validate_twilio_audio_format(media_format)
         await self.stream_tokens.consume_for_start(self.claims, call_sid)
         self.started = True
+        self.call_started_at = monotonic()
         call_sid_ctx.set(call_sid)
+        self._transition(CallPhase.STREAM_STARTED, "twilio_start_received")
 
         self.state = await self.memory.get(call_sid) or ConversationState(call_sid=call_sid)
         self.state.stream_sid = stream_sid
         self.state.caller_number = caller
         await self.memory.set(self.state)
+        self.customer_memory = await self.call_memory.load_memory(call_sid)
 
         async with SessionLocal() as session:
             repo = CallRepository(session)
             self.call = await repo.start_call(call_sid, stream_sid, caller)
 
         log.info("call_started", stream_sid=stream_sid, media_format=media_format, provider="openai_realtime")
-        await self._connect_openai()
-        self._spawn(self._openai_loop(), "openai_realtime_receiver")
+        self.openai_connect_task = self._spawn(self._connect_openai(request_greeting=True), "openai_realtime_connector")
+        self._spawn(self._silence_watchdog(), "silence_watchdog")
 
-    async def _connect_openai(self) -> None:
+    async def _connect_openai(self, *, request_greeting: bool) -> None:
+        self._transition(CallPhase.OPENAI_CONNECTING, "openai_connect_started")
         url = f"{OPENAI_REALTIME_URL}?model={self.settings.openai_realtime_model}"
-        log.info("openai_realtime_connecting", model=self.settings.openai_realtime_model)
-        self.openai_ws = await websockets.connect(
-            url,
-            additional_headers={
-                "Authorization": f"Bearer {self.settings.openai_api_key}",
-                "OpenAI-Safety-Identifier": self.claims.call_sid,
-            },
-            ping_interval=10,
-            ping_timeout=5,
-            max_size=2**23,
+        self.session_update_ack_event = asyncio.Event()
+        self.openai_ready = False
+        self.openai_connect_started_at = monotonic()
+        log.info(
+            "openai_connect_started",
+            model=self.settings.openai_realtime_model,
+            call_to_connect_start_ms=self._elapsed_ms(self.call_started_at, self.openai_connect_started_at),
         )
+        log.info("openai_realtime_connecting", model=self.settings.openai_realtime_model)
+        try:
+            self.openai_ws = await asyncio.wait_for(
+                websockets.connect(
+                    url,
+                    additional_headers={
+                        "Authorization": f"Bearer {self.settings.openai_api_key}",
+                        "OpenAI-Safety-Identifier": self.claims.call_sid,
+                    },
+                    ping_interval=None,
+                    ping_timeout=None,
+                    max_size=2**23,
+                ),
+                timeout=OPENAI_CONNECT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            log.exception(
+                "openai_connect_failed",
+                error=str(exc),
+                timeout_seconds=OPENAI_CONNECT_TIMEOUT_SECONDS,
+                call_to_failure_ms=self._elapsed_ms(self.call_started_at, monotonic()),
+            )
+            self.metrics.inc("voice_openai_connect_failed_total")
+            await self._stop(failure_reason=f"openai connect failed: {exc.__class__.__name__}")
+            return
+        self.openai_tcp_connected_at = monotonic()
+        log.info(
+            "openai_tcp_connected",
+            connect_duration_ms=self._elapsed_ms(self.openai_connect_started_at, self.openai_tcp_connected_at),
+            call_to_tcp_connected_ms=self._elapsed_ms(self.call_started_at, self.openai_tcp_connected_at),
+        )
+        self.openai_ws_connected_at = monotonic()
+        self.openai_connected_at = self.openai_ws_connected_at
+        log.info(
+            "openai_ws_connected",
+            connect_duration_ms=self._elapsed_ms(self.openai_connect_started_at, self.openai_ws_connected_at),
+            tcp_to_ws_ms=self._elapsed_ms(self.openai_tcp_connected_at, self.openai_ws_connected_at),
+            call_to_ws_connected_ms=self._elapsed_ms(self.call_started_at, self.openai_ws_connected_at),
+        )
+        connect_ms = self._elapsed_ms(self.openai_connect_started_at, self.openai_ws_connected_at)
+        if connect_ms is not None:
+            self.metrics.observe_ms("openai_connect", connect_ms)
+        if self.call_started_at:
+            log.info("openai_connected_latency_ms", latency_ms=round((self.openai_connected_at - self.call_started_at) * 1000, 2))
         log.info("openai_realtime_connected", model=self.settings.openai_realtime_model)
+        self._transition(CallPhase.OPENAI_CONNECTED, "openai_ws_connected")
+        self._spawn(self._openai_loop(), "openai_realtime_receiver")
+        self._spawn(self._openai_heartbeat_loop(), "openai_heartbeat")
+        self.session_update_sent_at = monotonic()
+        self._transition(CallPhase.SESSION_UPDATING, "session_update_sent")
+        session_instructions = _realtime_instructions()
+        persona_context = get_persona_context()
+        log.info(
+            "persona_context_loaded",
+            persona_source_file=inspect.getsourcefile(persona_module),
+            chars=len(persona_context),
+            preview=_preview(persona_context),
+        )
+        log.info("session_update_instructions_preview", chars=len(session_instructions), preview=_preview(session_instructions))
         await self._send_openai(
             {
                 "type": "session.update",
                 "session": {
                     "type": "realtime",
-                    "instructions": _realtime_instructions(),
+                    "instructions": session_instructions,
                     "output_modalities": ["audio"],
                     "audio": {
                         "input": {
@@ -143,11 +310,12 @@ class TwilioMediaSession:
                             "transcription": {"model": self.settings.openai_transcription_model},
                             "turn_detection": {
                                 "type": "server_vad",
-                                "threshold": 0.55,
+                                "threshold": 0.65,
                                 "prefix_padding_ms": 300,
-                                "silence_duration_ms": 650,
-                                "interrupt_response": True,
-                                "create_response": True,
+                                "silence_duration_ms": 800,
+                                "idle_timeout_ms": 6000,
+                                "interrupt_response": False,
+                                "create_response": False,
                             },
                         },
                         "output": {
@@ -159,21 +327,43 @@ class TwilioMediaSession:
                 },
             }
         )
-        log.info("openai_realtime_session_update_sent")
-        await self._send_openai(
-            {
-                "type": "response.create",
-                "response": {
-                    "modalities": ["audio"],
-                    "instructions": f"Start the call now by saying exactly: {GREETING}",
-                },
-            }
+        log.info(
+            "session_update_sent",
+            ws_to_session_update_sent_ms=self._elapsed_ms(self.openai_ws_connected_at, self.session_update_sent_at),
+            call_to_session_update_sent_ms=self._elapsed_ms(self.call_started_at, self.session_update_sent_at),
         )
-        log.info("openai_realtime_greeting_requested")
+        self.session_updated_at = monotonic()
+        if self.call_started_at:
+            log.info(
+                "openai_session_update_latency_ms",
+                latency_ms=round((self.session_updated_at - self.call_started_at) * 1000, 2),
+            )
+        log.info("openai_realtime_session_update_sent")
+        try:
+            await asyncio.wait_for(self.session_update_ack_event.wait(), timeout=SESSION_UPDATE_ACK_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            log.warning(
+                "session_update_ack_timeout",
+                timeout_seconds=SESSION_UPDATE_ACK_TIMEOUT_SECONDS,
+                call_to_timeout_ms=self._elapsed_ms(self.call_started_at, monotonic()),
+            )
+        session_update_ms = self._elapsed_ms(self.session_update_sent_at, self.session_update_ack_at)
+        if session_update_ms is not None:
+            self.metrics.observe_ms("session_update", session_update_ms)
+        self.openai_ready = True
+        self._transition(CallPhase.SESSION_READY, "session_ready")
+        await self._flush_early_audio()
+        if request_greeting:
+            self.greeting_clear_locked_until = monotonic() + GREETING_LOCK_SECONDS
+            log.info("greeting_started", lock_seconds=GREETING_LOCK_SECONDS)
+            await self._request_assistant_response(
+                self._build_greeting_instructions(),
+                reason="greeting",
+                force=True,
+            )
 
     async def _media(self, message: dict) -> None:
-        if not self.openai_ws:
-            return
+        self.last_activity_at = monotonic()
         payload = (message.get("media") or {}).get("payload")
         if not payload:
             return
@@ -182,8 +372,30 @@ class TwilioMediaSession:
         except Exception:
             self.metrics.inc("voice_bad_media_payload_total")
             return
+        if not self.openai_ws or not self.openai_ready:
+            before = len(self.early_audio_frames)
+            self.early_audio_frames.append(payload)
+            if before == self.early_audio_frames.maxlen:
+                self.metrics.inc("voice_early_audio_dropped_total")
+                log.warning("early_audio_frame_dropped", buffered_frames=len(self.early_audio_frames))
+            else:
+                self.metrics.gauge("voice_early_audio_buffered_frames", len(self.early_audio_frames))
+                if len(self.early_audio_frames) == 1 or len(self.early_audio_frames) % 50 == 0:
+                    log.info("early_audio_frame_buffered", buffered_frames=len(self.early_audio_frames))
+            return
         await self._send_openai({"type": "input_audio_buffer.append", "audio": payload})
         self.metrics.inc("voice_twilio_media_frames_total")
+
+    async def _flush_early_audio(self) -> None:
+        if not self.openai_ws or not self.openai_ready or not self.early_audio_frames:
+            return
+        frames = len(self.early_audio_frames)
+        log.info("early_audio_flush_started", frames=frames)
+        while self.early_audio_frames and self.openai_ws and self.openai_ready and not self.stopping:
+            await self._send_openai({"type": "input_audio_buffer.append", "audio": self.early_audio_frames.popleft()})
+            self.metrics.inc("voice_twilio_media_frames_total")
+        self.metrics.gauge("voice_early_audio_buffered_frames", len(self.early_audio_frames))
+        log.info("early_audio_flush_completed", frames=frames, remaining=len(self.early_audio_frames))
 
     async def _openai_loop(self) -> None:
         if not self.openai_ws:
@@ -194,33 +406,65 @@ class TwilioMediaSession:
                 await self._handle_openai_event(event)
         except ConnectionClosed as exc:
             if not self.stopping:
-                log.warning("openai_realtime_closed", code=exc.code, reason=exc.reason)
-                await self._stop(failure_reason=f"openai realtime closed: {exc.code}")
+                log.warning("openai_realtime_closed", code=exc.code, reason=exc.reason, phase=self.phase.value)
+                self.metrics.inc("openai_disconnect_total")
+                if exc.code == 1006 and "ping" in str(exc.reason).lower():
+                    self.metrics.inc("websocket_ping_timeout_total")
+                await self._recover_openai_connection(f"closed:{exc.code}")
         except Exception as exc:
             if not self.stopping:
                 log.exception("openai_realtime_receiver_failed", error=str(exc))
-                await self._stop(failure_reason=str(exc))
+                self.metrics.inc("openai_disconnect_total")
+                await self._recover_openai_connection(exc.__class__.__name__)
 
     async def _handle_openai_event(self, event: dict) -> None:
         event_type = event.get("type")
-        if event_type in {"session.created", "session.updated", "conversation.item.created"}:
+        if event_type == "session.updated":
+            self.session_update_ack_at = monotonic()
+            self.session_update_ack_event.set()
+            log.info(
+                "session_update_ack",
+                session_update_rtt_ms=self._elapsed_ms(self.session_update_sent_at, self.session_update_ack_at),
+                ws_to_session_update_ack_ms=self._elapsed_ms(self.openai_ws_connected_at, self.session_update_ack_at),
+                call_to_session_update_ack_ms=self._elapsed_ms(self.call_started_at, self.session_update_ack_at),
+            )
+            log.info("openai_realtime_event", openai_event=event_type)
+            return
+        if event_type in {"session.created", "conversation.item.created"}:
             log.info("openai_realtime_event", openai_event=event_type)
             return
         if event_type == "input_audio_buffer.speech_started":
+            self.last_activity_at = monotonic()
+            if self._greeting_locked():
+                log.info("interruption_ignored_during_greeting")
+                return
+            self.caller_speaking = True
+            self.caller_speech_started_at = monotonic()
+            self._transition(CallPhase.USER_SPEAKING, "openai_speech_started")
             log.info("openai_speech_started")
-            await self._clear_twilio_buffer()
+            if self._barge_in_task and not self._barge_in_task.done():
+                return
+            self._barge_in_task = self._spawn(self._confirm_barge_in_after_delay(), "barge_in_debounce")
             return
         if event_type == "input_audio_buffer.speech_stopped":
+            self.last_activity_at = monotonic()
+            self.caller_speaking = False
             log.info("openai_speech_stopped")
+            if not self.assistant_response_active and not self.assistant_speaking and not self.pending_marks:
+                await self._flush_deferred_response()
             return
-        if event_type in {"response.created", "response.output_item.added", "response.content_part.added"}:
-            log.info("openai_response_started", openai_event=event_type, response_id=event.get("response_id") or (event.get("response") or {}).get("id"))
+        if event_type == "response.created":
+            self._handle_response_started(event)
+            return
+        if event_type in {"response.output_item.added", "response.content_part.added"}:
+            log.info("openai_response_event", openai_event=event_type, response_id=event.get("response_id") or (event.get("response") or {}).get("id"))
             return
         if event_type in {"response.audio.delta", "response.output_audio.delta"}:
-            await self._send_twilio_audio(event.get("delta"))
+            await self._send_twilio_audio(event.get("delta"), response_id=event.get("response_id"))
             return
         if event_type in {"conversation.item.input_audio_transcription.completed", "input_audio_transcription.completed"}:
-            self._add_transcript_turn("user", event.get("transcript"))
+            transcript = event.get("transcript")
+            self._spawn(self._handle_user_transcript(transcript), "user_transcript_handler")
             return
         if event_type in {"response.audio_transcript.delta", "response.output_audio_transcript.delta"}:
             response_id = event.get("response_id") or "active"
@@ -231,36 +475,80 @@ class TwilioMediaSession:
         if event_type in {"response.audio_transcript.done", "response.output_audio_transcript.done"}:
             response_id = event.get("response_id") or "active"
             transcript = event.get("transcript") or "".join(self.assistant_transcript_parts.pop(response_id, []))
-            self._add_transcript_turn("assistant", transcript)
+            if self._add_transcript_turn("assistant", transcript):
+                self._spawn(self._record_assistant_question(transcript), "assistant_question_recorder")
+                self._spawn(self._record_assistant_metrics(transcript), "assistant_metrics_recorder")
             return
         if event_type in {"response.audio.done", "response.output_audio.done"}:
-            log.info("openai_response_audio_done", response_id=event.get("response_id"))
-            await self._send_twilio_mark(event.get("response_id") or "openai-response")
+            response_id = event.get("response_id") or self.current_response_id or "openai-response"
+            response_media_sent = self.response_audio_sent_counts.pop(response_id, 0)
+            log.info(
+                "assistant_audio_finished",
+                response_id=response_id,
+                media_sent=self.twilio_media_sent_count,
+                response_media_sent=response_media_sent,
+            )
+            if response_media_sent:
+                await self._send_twilio_mark(response_id)
+            else:
+                log.info("assistant_audio_done_no_twilio_audio", response_id=response_id)
             return
         if event_type == "response.done":
-            log.info("openai_response_completed", response_id=(event.get("response") or {}).get("id"))
+            self._handle_response_completed(event)
             return
         if event_type == "error":
             log.warning("openai_realtime_error", error=event.get("error"))
             return
         log.debug("openai_realtime_event_ignored", openai_event=event_type)
 
-    async def _send_twilio_audio(self, payload: str | None) -> None:
+    async def _send_twilio_audio(self, payload: str | None, *, response_id: str | None = None) -> None:
         if not payload or not self.state or not self.state.stream_sid:
             return
-        await self.websocket.send_text(json.dumps({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": payload}}))
+        if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
+            self.metrics.inc("voice_stale_audio_skipped_total")
+            log.info("stale_audio_skipped", response_id=response_id, reason="caller_speaking")
+            return
+        if not self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": payload}}, "audio"):
+            return
+        if not self.assistant_speaking:
+            self._set_assistant_speaking(True, "first_audio_delta")
+            self._transition(CallPhase.ASSISTANT_SPEAKING, "first_audio_delta")
+            self.response_first_audio_at = monotonic()
+            if self.first_audio_delta_at is None:
+                self.first_audio_delta_at = self.response_first_audio_at
+            log.info(
+                "first_audio_delta",
+                response_id=self.current_response_id,
+                response_create_to_first_audio_ms=self._elapsed_ms(self.response_create_sent_at, self.response_first_audio_at),
+                session_ack_to_first_audio_ms=self._elapsed_ms(self.session_update_ack_at, self.response_first_audio_at),
+                ws_to_first_audio_ms=self._elapsed_ms(self.openai_ws_connected_at, self.response_first_audio_at),
+                call_to_first_audio_ms=self._elapsed_ms(self.call_started_at, self.response_first_audio_at),
+            )
+            first_audio_ms = self._elapsed_ms(self.call_started_at, self.response_first_audio_at)
+            if first_audio_ms is not None:
+                self.metrics.observe_ms("first_audio", first_audio_ms)
+            log.info("assistant_audio_first_delta", response_id=self.current_response_id)
+        self.twilio_media_sent_count += 1
+        response_key = response_id or self.current_response_id
+        if response_key:
+            self.response_audio_sent_counts[response_key] = self.response_audio_sent_counts.get(response_key, 0) + 1
+        self.last_assistant_audio_at = monotonic()
         self.metrics.inc("voice_twilio_media_sent_total")
 
     async def _send_twilio_mark(self, response_id: str) -> None:
         if not self.state or not self.state.stream_sid:
             return
         mark_name = f"openai-{response_id}"[:120]
-        await self.websocket.send_text(json.dumps({"event": "mark", "streamSid": self.state.stream_sid, "mark": {"name": mark_name}}))
-        log.info("twilio_mark_sent", mark_name=mark_name)
+        if not self._enqueue_twilio_message({"event": "mark", "streamSid": self.state.stream_sid, "mark": {"name": mark_name}}, "mark"):
+            log.warning("twilio_mark_enqueue_failed", mark_name=mark_name)
+            return
+        self.pending_marks.add(mark_name)
+        self.mark_response_ids[mark_name] = response_id
+        log.info("twilio_mark_sent", mark_name=mark_name, pending_marks=len(self.pending_marks))
 
     async def _clear_twilio_buffer(self) -> None:
         if self.state and self.state.stream_sid:
-            await self.websocket.send_text(json.dumps({"event": "clear", "streamSid": self.state.stream_sid}))
+            self._enqueue_twilio_message({"event": "clear", "streamSid": self.state.stream_sid}, "clear")
             self.metrics.inc("voice_twilio_clear_total")
             log.info("twilio_clear_sent")
 
@@ -269,10 +557,389 @@ class TwilioMediaSession:
             raise RuntimeError("OpenAI realtime websocket is not connected")
         await self.openai_ws.send(json.dumps(event))
 
+    async def _request_assistant_response(self, instructions: str, *, reason: str, force: bool = False) -> bool:
+        allowed, blocked_reason = self._response_gate(reason=reason, force=force)
+        log.info(
+            "response_gate_check",
+            reason=reason,
+            force=force,
+            allowed=allowed,
+            blocked_reason=blocked_reason,
+            response_active=self.assistant_response_active,
+            assistant_speaking=self.assistant_speaking,
+            pending_marks=len(self.pending_marks),
+            greeting_locked=self._greeting_locked(),
+        )
+        if not allowed:
+            if reason == "user_transcript":
+                self.deferred_response_instructions = instructions
+                self.deferred_response_reason = reason
+            log.info(
+                "response_gate_blocked",
+                reason=reason,
+                blocked_reason=blocked_reason,
+                deferred=reason == "user_transcript",
+            )
+            log.info(
+                "response_create_suppressed",
+                reason=reason,
+                response_active=self.assistant_response_active,
+                assistant_speaking=self.assistant_speaking,
+                greeting_locked=self._greeting_locked(),
+            )
+            return False
+        log.info("response_gate_passed", reason=reason)
+        log.info("response_create_instructions_preview", reason=reason, chars=len(instructions), preview=_preview(instructions))
+        await self._send_openai({"type": "response.create", "response": {"instructions": instructions}})
+        self.response_create_sent_at = monotonic()
+        if reason == "greeting":
+            self.greeting_response_create_at = self.response_create_sent_at
+        log.info(
+            "response_create_sent",
+            reason=reason,
+            session_ack_to_response_create_ms=self._elapsed_ms(self.session_update_ack_at, self.response_create_sent_at),
+            session_update_sent_to_response_create_ms=self._elapsed_ms(self.session_update_sent_at, self.response_create_sent_at),
+            ws_to_response_create_ms=self._elapsed_ms(self.openai_ws_connected_at, self.response_create_sent_at),
+            call_to_response_create_ms=self._elapsed_ms(self.call_started_at, self.response_create_sent_at),
+        )
+        return True
+
+    @staticmethod
+    def _elapsed_ms(start: float | None, end: float | None) -> float | None:
+        if start is None or end is None:
+            return None
+        return round((end - start) * 1000, 2)
+
+    def _response_gate(self, *, reason: str, force: bool = False) -> tuple[bool, str | None]:
+        if force:
+            return True, None
+        if self._greeting_locked():
+            return False, "greeting_locked"
+        if reason == "user_transcript" and (self.caller_speaking or self.phase == CallPhase.USER_SPEAKING):
+            return False, "caller_speaking"
+        if self.assistant_response_active:
+            return False, "assistant_response_active"
+        if self.assistant_speaking:
+            if not self.pending_marks and self.response_completed_at:
+                self._set_assistant_speaking(False, "stale_speaking_state_recovered")
+                return True, None
+            return False, "assistant_speaking"
+        return True, None
+
+    async def _flush_deferred_response(self) -> None:
+        if not self.deferred_response_instructions or self.stopping:
+            return
+        instructions = self.deferred_response_instructions
+        reason = self.deferred_response_reason or "deferred_user_transcript"
+        self.deferred_response_instructions = None
+        self.deferred_response_reason = None
+        log.info("deferred_response_flush", reason=reason)
+        await self._request_assistant_response(instructions, reason=reason)
+
+    async def _handle_user_transcript(self, transcript: str | None) -> None:
+        async with self._transcript_lock:
+            await self._handle_user_transcript_locked(transcript)
+
+    async def _handle_user_transcript_locked(self, transcript: str | None) -> None:
+        if not self.state or not self._add_transcript_turn("user", transcript):
+            return
+        self._transition(CallPhase.PROCESSING_USER, "user_transcript_completed")
+        text = str(transcript or "")
+        updates = extract_customer_facts(text, self.customer_memory)
+        updates.update(detect_language_update(text, self.customer_memory))
+        profile_result = classify_customer_profile_with_confidence(text, self.customer_memory)
+        profile = profile_result.get("profile")
+        if profile:
+            updates["customer_profile"] = profile
+            updates["intent_type"] = profile
+            log.info(
+                "intent_classification_result",
+                customer_profile=profile,
+                confidence=profile_result.get("confidence"),
+                reason=profile_result.get("reason"),
+            )
+        objections = detect_objections(text)
+        if objections:
+            updates["objections"] = merge_objections(self.customer_memory, objections)
+        updates["conversation_metrics"] = user_turn_metrics(self.customer_memory, text, objections)
+        stage_result = determine_stage_with_reason(text, self.customer_memory, objections)
+        stage = stage_result.get("stage")
+        if stage:
+            updates["conversation_stage"] = stage
+            log.info(
+                "conversation_stage_result",
+                stage=stage,
+                confidence=stage_result.get("confidence"),
+                reason=stage_result.get("reason"),
+            )
+        projected_memory = dict(self.customer_memory)
+        projected_memory.update({key: value for key, value in updates.items() if key != "objections"})
+        if objections:
+            projected_memory["objections"] = updates["objections"]
+        updates["lead_score"] = calculate_lead_score(projected_memory)
+        if updates:
+            self.customer_memory = await self.call_memory.update_memory(self.state.call_sid, updates)
+            log.info("customer_memory_updated", fields=sorted(updates.keys()))
+            if "language" in updates:
+                log.info("language_locked", language=self.customer_memory.get("language"), locked=self.customer_memory.get("language_locked"))
+            if "conversation_stage" in updates:
+                log.info("conversation_stage_changed", stage=self.customer_memory.get("conversation_stage"))
+            if "customer_profile" in updates:
+                log.info("intent_classified", customer_profile=self.customer_memory.get("customer_profile"))
+            if objections:
+                log.info("objection_detected", objections=objections)
+        else:
+            self.customer_memory = await self.call_memory.load_memory(self.state.call_sid)
+        await self._request_assistant_response(
+            self._build_response_instructions(),
+            reason="user_transcript",
+        )
+
+    async def _record_assistant_question(self, transcript: str | None) -> None:
+        if not self.state:
+            return
+        field = infer_asked_field(str(transcript or ""))
+        if not field:
+            return
+        updates = record_question(self.customer_memory, field)
+        self.customer_memory = await self.call_memory.update_memory(self.state.call_sid, updates)
+        log.info("asked_question_recorded", field=field)
+
+    async def _record_assistant_metrics(self, transcript: str | None) -> None:
+        if not self.state:
+            return
+        latency_ms = self._elapsed_ms(self.response_started_at, monotonic())
+        metrics = assistant_turn_metrics(self.customer_memory, str(transcript or ""), response_latency_ms=latency_ms)
+        self.customer_memory = await self.call_memory.update_memory(self.state.call_sid, {"conversation_metrics": metrics})
+        if metrics.get("robotic_behavior_detected"):
+            log.warning("robotic_behavior_detected", metrics=metrics)
+
+    def _build_response_instructions(self) -> str:
+        context = build_dynamic_response_context(
+            get_persona_context(),
+            "\n\n".join(
+                (
+                    get_language_context(self.customer_memory),
+                    build_memory_context(self.customer_memory),
+                    get_stage_context(self.customer_memory),
+                    get_profile_context(self.customer_memory),
+                    get_objection_context(self.customer_memory),
+                    get_lead_score_context(self.customer_memory),
+                )
+            ),
+        )
+        do_not_ask = ", ".join(field for field in ("budget", "bhk", "location_interest", "purpose", "visit_interest") if not can_ask(self.customer_memory, field))
+        return (
+            f"{context}\n\n"
+            "Now answer the caller's latest message only.\n"
+            "Use the locked language. Maximum 20 words. Add one small follow-up only if needed.\n"
+            "If the caller asks for 1 BHK, rental, commercial, plot, shop, office, villa, or 4 BHK, say it is not confirmed and redirect to available 2 BHK or 3 BHK.\n"
+            f"Do not ask these fields again: {do_not_ask or 'none'}.\n"
+            "Do not repeat questions listed as already asked. Prioritize site visit booking over collecting missing fields."
+        )
+
+    def _build_greeting_instructions(self) -> str:
+        context = build_dynamic_response_context(
+            get_persona_context(),
+            "\n\n".join(
+                (
+                    get_language_context(self.customer_memory),
+                    build_memory_context(self.customer_memory),
+                    get_stage_context(self.customer_memory),
+                    get_profile_context(self.customer_memory),
+                    get_objection_context(self.customer_memory),
+                    get_lead_score_context(self.customer_memory),
+                )
+            ),
+        )
+        instructions = (
+            f"{context}\n\n"
+            f"Start the call with exactly this short greeting, then stop: {GREETING}\n"
+            "Do not add extra questions or explanations."
+        )
+        log.info("greeting_instructions_preview", chars=len(instructions), preview=_preview(instructions))
+        return instructions
+
+    def _handle_response_started(self, event: dict) -> None:
+        response_id = (event.get("response") or {}).get("id") or event.get("response_id")
+        if self.assistant_response_active and response_id != self.current_response_id:
+            log.info("response_started_while_active", current_response_id=self.current_response_id, new_response_id=response_id)
+        self.assistant_response_active = True
+        self.current_response_id = response_id
+        self.response_started_at = monotonic()
+        self.response_completed_at = None
+        self.response_first_audio_at = None
+        if self.greeting_response_id is None:
+            self.greeting_response_id = response_id
+        log.info("assistant_response_started", response_id=response_id)
+        self._spawn(self._response_audio_watchdog(response_id), "response_audio_watchdog")
+
+    def _handle_response_completed(self, event: dict) -> None:
+        response_id = (event.get("response") or {}).get("id") or self.current_response_id
+        self.response_completed_at = monotonic()
+        self.assistant_response_active = False
+        if response_id == self.current_response_id:
+            self.current_response_id = None
+        response_ms = self._elapsed_ms(self.response_started_at, self.response_completed_at)
+        if response_ms is not None:
+            self.metrics.observe_ms("assistant_response", response_ms)
+        log.info("assistant_response_completed", response_id=response_id)
+
+    async def _handle_twilio_mark(self, message: dict) -> None:
+        mark_name = (message.get("mark") or {}).get("name")
+        if mark_name:
+            self.pending_marks.discard(mark_name)
+            response_id = self.mark_response_ids.pop(mark_name, None)
+            if not self.pending_marks:
+                self._set_assistant_speaking(False, "twilio_mark_ack")
+                if self.phase == CallPhase.USER_SPEAKING or self.caller_speaking:
+                    log.info(
+                        "twilio_mark_ack_state_transition_skipped",
+                        mark_name=mark_name,
+                        current_state=self.phase,
+                        caller_speaking=self.caller_speaking,
+                        reason="caller_speaking",
+                    )
+                elif not self.assistant_response_active:
+                    self._transition(CallPhase.WAITING_FOR_USER, "twilio_mark_ack")
+            if response_id == self.greeting_response_id and not self.greeting_completed:
+                self.greeting_completed = True
+                log.info("greeting_finished", response_id=response_id)
+            log.info("twilio_mark_ack", mark_name=mark_name, pending_marks=len(self.pending_marks), assistant_speaking=self.assistant_speaking)
+            if (
+                not self.pending_marks
+                and not self.assistant_response_active
+                and self.phase != CallPhase.USER_SPEAKING
+                and not self.caller_speaking
+            ):
+                await self._flush_deferred_response()
+
+    async def _confirm_barge_in_after_delay(self) -> None:
+        await asyncio.sleep(BARGE_IN_DEBOUNCE_SECONDS)
+        if self.stopping or not self.caller_speaking or not self.caller_speech_started_at:
+            return
+        speech_seconds = monotonic() - self.caller_speech_started_at
+        if speech_seconds < BARGE_IN_DEBOUNCE_SECONDS:
+            return
+        if self._greeting_locked():
+            log.info("interruption_ignored_during_greeting", speech_ms=round(speech_seconds * 1000, 2))
+            return
+        if not (self.assistant_speaking or self.assistant_response_active):
+            log.info("barge_in_ignored_no_assistant_audio", speech_ms=round(speech_seconds * 1000, 2))
+            return
+        log.info("barge_in_confirmed", speech_ms=round(speech_seconds * 1000, 2), response_id=self.current_response_id)
+        await self._clear_twilio_buffer()
+        await self._cancel_current_openai_response("barge_in")
+
+    async def _cancel_current_openai_response(self, reason: str) -> None:
+        if not self.assistant_response_active and not self.assistant_speaking and self.current_response_id is None:
+            log.info("assistant_response_cancel_ignored", reason=reason)
+            return
+        if self.openai_ws and self.assistant_response_active:
+            with contextlib.suppress(Exception):
+                await self._send_openai({"type": "response.cancel"})
+        self.assistant_response_active = False
+        self._set_assistant_speaking(False, reason)
+        self.current_response_id = None
+        self.response_completed_at = monotonic()
+        log.info("assistant_response_cancelled", reason=reason)
+
+    async def _twilio_sender_loop(self) -> None:
+        while not self.stopping:
+            raw = await self.twilio_outbound_queue.get()
+            try:
+                await self.websocket.send_text(raw)
+            finally:
+                self.twilio_outbound_queue.task_done()
+
+    def _enqueue_twilio_message(self, message: dict[str, Any], kind: str) -> bool:
+        try:
+            self.twilio_outbound_queue.put_nowait(json.dumps(message))
+        except asyncio.QueueFull:
+            self.metrics.inc("voice_twilio_outbound_queue_full_total")
+            log.error("twilio_outbound_queue_full", kind=kind, queue_depth=self.twilio_outbound_queue.qsize())
+            return False
+        return True
+
+    async def _openai_heartbeat_loop(self) -> None:
+        while not self.stopping and self.openai_ws:
+            await asyncio.sleep(OPENAI_HEARTBEAT_SECONDS)
+            if self.stopping or not self.openai_ws:
+                return
+            started = monotonic()
+            try:
+                pong = await self.openai_ws.ping()
+                await asyncio.wait_for(pong, timeout=OPENAI_PONG_TIMEOUT_SECONDS)
+                log.info("openai_heartbeat_ok", latency_ms=self._elapsed_ms(started, monotonic()))
+            except asyncio.TimeoutError:
+                self.metrics.inc("websocket_ping_timeout_total")
+                log.warning("openai_heartbeat_timeout", timeout_seconds=OPENAI_PONG_TIMEOUT_SECONDS, phase=self.phase.value)
+                await self._recover_openai_connection("heartbeat_timeout")
+                return
+            except Exception as exc:
+                log.warning("openai_heartbeat_failed", error=str(exc), phase=self.phase.value)
+                await self._recover_openai_connection(exc.__class__.__name__)
+                return
+
+    async def _recover_openai_connection(self, reason: str) -> None:
+        if self.stopping or self.openai_recovering:
+            return
+        self.openai_recovering = True
+        self.openai_ready = False
+        old_ws = self.openai_ws
+        self.openai_ws = None
+        with contextlib.suppress(Exception):
+            if old_ws:
+                await old_ws.close()
+        safe_reconnect_phases = {CallPhase.SESSION_READY, CallPhase.WAITING_FOR_USER, CallPhase.USER_SPEAKING, CallPhase.PROCESSING_USER}
+        try:
+            if self.phase not in safe_reconnect_phases or self.assistant_speaking or self.assistant_response_active:
+                await self._stop(failure_reason=f"openai realtime closed during unsafe phase: {reason}")
+                return
+            if self.openai_reconnect_attempts >= OPENAI_RECONNECT_ATTEMPTS:
+                await self._stop(failure_reason=f"openai realtime closed: {reason}")
+                return
+            self.openai_reconnect_attempts += 1
+            self.metrics.inc("openai_reconnect_total")
+            log.info("openai_reconnect_started", reason=reason, attempt=self.openai_reconnect_attempts, phase=self.phase.value)
+            await asyncio.sleep(0.5)
+            await self._connect_openai(request_greeting=False)
+        finally:
+            self.openai_recovering = False
+
+    def _set_assistant_speaking(self, value: bool, reason: str) -> None:
+        if self.assistant_speaking == value:
+            return
+        self.assistant_speaking = value
+        log.info("assistant_state_changed", field="assistant_speaking", value=value, reason=reason)
+
+    async def _response_audio_watchdog(self, response_id: str | None) -> None:
+        await asyncio.sleep(RESPONSE_AUDIO_TIMEOUT_SECONDS)
+        if self.stopping or response_id != self.current_response_id or self.response_first_audio_at:
+            return
+        log.warning("fallback_triggered", reason="response_audio_timeout", response_id=response_id)
+        await self._cancel_current_openai_response("response_audio_timeout")
+        await self._request_assistant_response("Ji sir, ek second.", reason="response_audio_timeout", force=True)
+
+    async def _silence_watchdog(self) -> None:
+        while not self.stopping:
+            await asyncio.sleep(2.0)
+            if self.assistant_response_active or self.assistant_speaking or self.caller_speaking or self._greeting_locked():
+                continue
+            idle_seconds = monotonic() - self.last_activity_at
+            if idle_seconds >= SILENCE_PROMPT_SECONDS:
+                self.last_activity_at = monotonic()
+                log.info("fallback_triggered", reason="silence_watchdog", idle_seconds=round(idle_seconds, 2))
+                await self._request_assistant_response("Hello sir, am I audible?", reason="silence_watchdog")
+
+    def _greeting_locked(self) -> bool:
+        return not self.greeting_completed and monotonic() < self.greeting_clear_locked_until
+
     async def _stop(self, failure_reason: str | None = None) -> None:
         if self.stopping:
             return
         self.stopping = True
+        self._transition(CallPhase.FAILED if failure_reason else CallPhase.CALL_ENDING, failure_reason or "normal_stop")
         await self._close_openai()
         if self.state:
             summary = await self._summarize_and_persist_call()
@@ -282,6 +949,8 @@ class TwilioMediaSession:
                 if call:
                     await repo.finish_call(call, summary, failure_reason)
             await self.memory.delete(self.state.call_sid)
+        self._transition(CallPhase.FAILED if failure_reason else CallPhase.COMPLETED, failure_reason or "call_completed")
+        self.metrics.inc("call_failure_total" if failure_reason else "call_success_total")
         log.info("call_finished", failure_reason=failure_reason)
 
     async def _summarize_and_persist_call(self) -> dict[str, Any] | None:
@@ -291,16 +960,18 @@ class TwilioMediaSession:
         log.info("call_completion_started", transcript_chars=len(transcript), transcript_turns=len(self.transcript_turns))
         summary = await self.summarizer.summarize(transcript)
         payload = self._crm_payload(summary, transcript)
-        await self.crm.insert_call(payload)
+        await self.crm_outbox.enqueue_and_try_delivery(payload)
         log.info("call_completion_saved", lead_status=summary.get("lead_status"))
         return summary
 
-    def _add_transcript_turn(self, role: str, text: str | None) -> None:
+    def _add_transcript_turn(self, role: str, text: str | None) -> bool:
         cleaned = " ".join(str(text or "").split())
-        if not cleaned:
-            return
+        if not cleaned or cleaned in {".", ",", "?", "!", "h", "hm", "haan?"}:
+            log.info("transcript_ignored", role=role, text=cleaned)
+            return False
         self.transcript_turns.append({"role": role, "text": cleaned})
         log.info("transcript_accumulated", role=role, chars=len(cleaned), turns=len(self.transcript_turns))
+        return True
 
     def _full_transcript(self) -> str:
         lines = [f"{turn['role'].title()}: {turn['text']}" for turn in self.transcript_turns]
@@ -328,6 +999,14 @@ class TwilioMediaSession:
             "objections": _text_or_none(_serialize_text(lead_info.get("objections"))),
             "summary": _text_or_none(summary.get("summary")),
             "full_transcript": transcript,
+            "lead_score": int(self.customer_memory.get("lead_score") or 0),
+            "language": _text_or_none(self.customer_memory.get("language")),
+            "conversation_stage": _text_or_none(self.customer_memory.get("conversation_stage")),
+            "customer_profile": _text_or_none(self.customer_memory.get("customer_profile")),
+            "visit_day": _text_or_none(self.customer_memory.get("visit_day")),
+            "visit_time": _text_or_none(self.customer_memory.get("visit_time")),
+            "decision_maker": _text_or_none(self.customer_memory.get("decision_maker")),
+            "enriched_memory": self.customer_memory,
         }
 
     async def _close_openai(self) -> None:
@@ -347,8 +1026,32 @@ class TwilioMediaSession:
     def _spawn(self, coro, name: str) -> asyncio.Task:
         task = asyncio.create_task(coro, name=name)
         self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        task.add_done_callback(self._task_done)
         return task
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        self.tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if not exc:
+            return
+        log.exception("background_task_failed", task_name=task.get_name(), error=str(exc))
+        self.metrics.inc("voice_background_task_failed_total")
+        if not self.stopping:
+            asyncio.create_task(self._stop(failure_reason=f"background task failed: {task.get_name()}"))
+
+    def _transition(self, phase: CallPhase, reason: str) -> None:
+        if self.phase == phase:
+            return
+        previous = self.phase
+        if phase not in ALLOWED_PHASE_TRANSITIONS.get(previous, set()):
+            self.metrics.inc("voice_invalid_state_transition_total")
+            log.error("invalid_call_state_transition", previous=previous.value, attempted=phase.value, reason=reason)
+            raise RuntimeError(f"invalid call state transition: {previous.value} -> {phase.value}")
+        self.phase = phase
+        self.metrics.inc("voice_state_transition_total")
+        log.info("call_state_transition", previous=previous.value, new=phase.value, reason=reason)
 
     async def _cancel_tasks(self) -> None:
         tasks = [task for task in self.tasks if not task.done()]
@@ -362,11 +1065,21 @@ class TwilioMediaSession:
 def _realtime_instructions() -> str:
     return (
         SYSTEM_PROMPT
+        + "\n\n"
+        + get_persona_context()
         + "\n\nDemo call rules:\n"
+        + "- The opening greeting is sent separately by the system. Never repeat it after the first assistant message.\n"
+        + "- Default language is Hinglish, but obey explicit language changes from the caller.\n"
+        + "- After greeting, wait for the caller. Do not immediately ask another question unless the caller responds.\n"
+        + "- Keep every reply under 20 words, plus one small follow-up question only if useful.\n"
+        + "- Never give long English paragraphs, corporate wording, or multiple recommendations together.\n"
+        + "- Answer only the caller's latest intent. Never resume an interrupted sentence.\n"
+        + "- If caller asks 1 BHK, single room, PG, studio, rental, commercial, plot, shop, office, villa, or 4 BHK, do not think silently. Immediately say it is not confirmed and redirect to 2 BHK or 3 BHK.\n"
+        + "- If you are unsure, do not pause. Say: Sir exact detail WhatsApp pe confirm kara dunga.\n"
         + "- Speak very clearly, slowly, and briefly.\n"
         + "- Use simple Hindi-English Roman speech.\n"
-        + "- Sound like a confident PG admissions counsellor, not a generic assistant.\n"
-        + "- Mention one useful benefit when answering: food included, safe setup, clean rooms, or convenient location.\n"
+        + "- Sound like a confident real estate sales advisor, not a generic assistant.\n"
+        + "- Mention one useful property benefit when answering: budget fit, location, ready possession, connectivity, or amenities.\n"
         + "- Do not repeat the same question if the user already answered.\n"
         + "- If audio is unclear, ask one short clarification.\n"
     )
@@ -400,3 +1113,7 @@ def _serialize_text(value: Any) -> str | None:
     if isinstance(value, dict):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def _preview(text: str, limit: int = 600) -> str:
+    return " ".join(str(text or "").split())[:limit]

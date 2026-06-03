@@ -19,6 +19,16 @@ LEAD_INFO_FIELDS = {
     "visit_interest",
     "objections",
 }
+CRM_ENRICHMENT_FIELDS = {
+    "lead_score",
+    "language",
+    "intent_type",
+    "conversation_stage",
+    "customer_profile",
+    "visit_day",
+    "visit_time",
+    "decision_maker",
+}
 VALID_LEAD_STATUSES = {"new", "qualified", "visit_booked", "callback_scheduled", "not_interested", "needs_follow_up"}
 
 
@@ -78,6 +88,7 @@ def _normalize_summary(value: dict[str, Any]) -> dict[str, Any]:
         "sentiment": _optional_text(value.get("sentiment")),
         "outcome": _optional_text(value.get("outcome")),
         "lead_info": normalized_lead_info,
+        "crm_enrichment": _normalize_crm_enrichment(value.get("crm_enrichment")),
     }
 
 
@@ -89,7 +100,14 @@ def _fallback_summary(reason: str, transcript: str | None = None) -> dict[str, A
         "sentiment": None,
         "outcome": "needs manual review",
         "lead_info": {field: None for field in LEAD_INFO_FIELDS},
+        "crm_enrichment": {field: None for field in CRM_ENRICHMENT_FIELDS},
     }
+
+
+def _normalize_crm_enrichment(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    return {field: value.get(field) for field in CRM_ENRICHMENT_FIELDS}
 
 
 def _optional_text(value: Any) -> str | None:

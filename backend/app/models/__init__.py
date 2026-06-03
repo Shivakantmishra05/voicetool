@@ -1,4 +1,3 @@
-from app.models.call import Call, CallStatus, LeadStatus, TranscriptTurn
+from app.models.call import CRMOutboxEvent, CRMOutboxStatus, Call, CallStatus, LeadStatus, TranscriptTurn, TwilioStatusEvent
 
-__all__ = ["Call", "CallStatus", "LeadStatus", "TranscriptTurn"]
-
+__all__ = ["CRMOutboxEvent", "CRMOutboxStatus", "Call", "CallStatus", "LeadStatus", "TranscriptTurn", "TwilioStatusEvent"]

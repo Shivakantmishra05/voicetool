@@ -1,3 +1,5 @@
+from time import perf_counter
+
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 
@@ -5,6 +7,7 @@ from app.config import Settings, get_settings
 from app.telephony.security import validate_twilio_request
 from app.telephony.stream_auth import StreamTokenService
 from app.telephony.twilio import inbound_stream_twiml
+from app.services.twilio_status import persist_twilio_status
 from app.utils.logging import log
 
 router = APIRouter(prefix="/twilio", tags=["twilio"])
@@ -12,6 +15,7 @@ router = APIRouter(prefix="/twilio", tags=["twilio"])
 
 @router.post("/voice")
 async def inbound_voice(request: Request, settings: Settings = Depends(get_settings)) -> Response:
+    started = perf_counter()
     await validate_twilio_request(request, settings)
     form = await request.form()
     call_sid = str(form.get("CallSid") or "")
@@ -26,4 +30,25 @@ async def inbound_voice(request: Request, settings: Settings = Depends(get_setti
         websocket_path="/ws/twilio/{token}",
         token_preview=token_service.preview(stream_token),
     )
+    request.app.state.metrics.observe_ms("twilio_webhook_latency", (perf_counter() - started) * 1000)
     return Response(content=inbound_stream_twiml(settings, form.get("From"), stream_token), media_type="application/xml")
+
+
+@router.post("/status")
+async def call_status(request: Request, settings: Settings = Depends(get_settings)) -> Response:
+    started = perf_counter()
+    await validate_twilio_request(request, settings)
+    form = await request.form()
+    await persist_twilio_status(dict(form), "call_status")
+    request.app.state.metrics.observe_ms("twilio_status_callback_latency", (perf_counter() - started) * 1000)
+    return Response(status_code=204)
+
+
+@router.post("/stream-status")
+async def stream_status(request: Request, settings: Settings = Depends(get_settings)) -> Response:
+    started = perf_counter()
+    await validate_twilio_request(request, settings)
+    form = await request.form()
+    await persist_twilio_status(dict(form), "stream_status")
+    request.app.state.metrics.observe_ms("twilio_stream_status_callback_latency", (perf_counter() - started) * 1000)
+    return Response(status_code=204)

@@ -41,8 +41,8 @@ class CallRepository:
         call.failure_reason = failure_reason
         if summary:
             call.summary = summary.get("summary")
-            call.sentiment = summary.get("sentiment")
-            call.outcome = summary.get("outcome")
+            call.sentiment = _truncate(summary.get("sentiment"), 40)
+            call.outcome = _truncate(summary.get("outcome"), 120)
             call.lead_info = summary.get("lead_info") or {}
             status = summary.get("lead_status")
             if status in LeadStatus._value2member_map_:
@@ -69,3 +69,9 @@ class CallRepository:
         result = await self.session.execute(select(Call).order_by(Call.created_at.desc()).limit(limit))
         return list(result.scalars().all())
 
+
+def _truncate(value: Any, max_len: int) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text[:max_len]

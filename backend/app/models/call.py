@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, Index, Integer, JSON, String, Text
+from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, TimestampMixin
@@ -60,3 +60,43 @@ class TranscriptTurn(Base, TimestampMixin):
 
     call: Mapped[Call] = relationship(back_populates="turns")
 
+
+class CRMOutboxStatus(str, Enum):
+    pending = "pending"
+    delivered = "delivered"
+    failed = "failed"
+
+
+class CRMOutboxEvent(Base, TimestampMixin):
+    __tablename__ = "crm_outbox_events"
+    __table_args__ = (
+        Index("ix_crm_outbox_status_next_attempt", "status", "next_attempt_at"),
+        Index("ix_crm_outbox_call_sid", "call_sid"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    call_sid: Mapped[str] = mapped_column(String(80), nullable=False)
+    destination: Mapped[str] = mapped_column(String(40), nullable=False, default="supabase")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[CRMOutboxStatus] = mapped_column(SAEnum(CRMOutboxStatus), default=CRMOutboxStatus.pending, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class TwilioStatusEvent(Base, TimestampMixin):
+    __tablename__ = "twilio_status_events"
+    __table_args__ = (
+        Index("ix_twilio_status_call_sid", "call_sid"),
+        UniqueConstraint("call_sid", "event_type", "sequence", name="uq_twilio_status_call_event_sequence"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    call_sid: Mapped[str] = mapped_column(String(80), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    call_status: Mapped[str | None] = mapped_column(String(80))
+    error_code: Mapped[str | None] = mapped_column(String(40))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    sequence: Mapped[str] = mapped_column(String(80), nullable=False, default="0")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

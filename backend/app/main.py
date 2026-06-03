@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket
@@ -12,6 +14,7 @@ from app.observability import Metrics
 from app.database.session import SessionLocal
 from app.services.memory import ConversationMemory
 from app.services.call_summary import CallSummarizer
+from app.services.crm_outbox import CRMOutbox
 from app.services.startup_diagnostics import run_startup_diagnostics
 from app.services.supabase_crm import SupabaseCRM
 from app.telephony.stream_auth import StreamTokenService
@@ -36,9 +39,17 @@ async def lifespan(app: FastAPI):
     app.state.stream_tokens = StreamTokenService(settings, memory)
     app.state.summarizer = CallSummarizer(settings)
     app.state.crm = SupabaseCRM(settings)
+    app.state.crm_outbox = CRMOutbox(app.state.crm, app.state.metrics)
+    app.state.crm_outbox_task = None
     async with SessionLocal() as session:
         app.state.startup_diagnostics = await run_startup_diagnostics(settings, memory, session)
+    app.state.crm_outbox_task = asyncio.create_task(app.state.crm_outbox.run_forever(), name="crm_outbox_worker")
     yield
+    app.state.crm_outbox.stop()
+    if app.state.crm_outbox_task:
+        app.state.crm_outbox_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await app.state.crm_outbox_task
     await app.state.memory.close()
 
 
@@ -100,6 +111,7 @@ async def _twilio_media_authenticated(websocket: WebSocket, stream_token: str | 
         app.state.metrics,
         app.state.summarizer,
         app.state.crm,
+        app.state.crm_outbox,
     )
     await session.run()
 

@@ -89,6 +89,15 @@ class Settings(BaseSettings):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: str) -> str:
+        if isinstance(value, str) and value.startswith("postgres://"):
+            return "postgresql+asyncpg://" + value.removeprefix("postgres://")
+        if isinstance(value, str) and value.startswith("postgresql://"):
+            return "postgresql+asyncpg://" + value.removeprefix("postgresql://")
+        return value
+
     @property
     def websocket_url(self) -> str:
         base = str(self.public_base_url).rstrip("/")
@@ -107,6 +116,12 @@ class Settings(BaseSettings):
             for name in ("stream_token_secret", "admin_username", "admin_password", "admin_session_secret"):
                 if not getattr(self, name, None):
                     missing.append(name.upper())
+            if not self.require_redis:
+                missing.append("REQUIRE_REDIS=true")
+            if not self.startup_provider_checks_required:
+                missing.append("STARTUP_PROVIDER_CHECKS_REQUIRED=true")
+            if self.supabase_key and self.supabase_key.startswith("sb_publishable"):
+                missing.append("SUPABASE_KEY service-role/server key")
         if missing:
             raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
         if self.deepgram_utterance_end_ms < 1000:
