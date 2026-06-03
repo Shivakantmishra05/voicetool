@@ -38,14 +38,14 @@ from app.utils.logging import call_sid_ctx, log
 
 
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
-GREETING = "Namaste ji, Riya DreamHome se bol rahi hoon. Flat ke liye enquiry thi na?"
-GREETING_LOCK_SECONDS = 1.8
-BARGE_IN_DEBOUNCE_SECONDS = 0.3
-RESPONSE_AUDIO_TIMEOUT_SECONDS = 2.0
-SILENCE_PROMPT_SECONDS = 7.0
+GREETING = "Namaste ji, Riya DreamHome Properties se bol rahi hoon. Kya abhi 2 minute baat ho sakti hai?"
+GREETING_LOCK_SECONDS = 2.2
+BARGE_IN_DEBOUNCE_SECONDS = 0.35
+RESPONSE_AUDIO_TIMEOUT_SECONDS = 2.5
+SILENCE_PROMPT_SECONDS = 8.0
 MAX_SILENCE_PROMPTS = 2
-MAX_CALL_SECONDS = 180.0
-OPENAI_CONNECT_TIMEOUT_SECONDS = 3.5
+MAX_CALL_SECONDS = 210.0
+OPENAI_CONNECT_TIMEOUT_SECONDS = 4.0
 SESSION_UPDATE_ACK_TIMEOUT_SECONDS = 2.0
 EARLY_AUDIO_BUFFER_FRAMES = 300
 TWILIO_OUTBOUND_QUEUE_SIZE = 1000
@@ -314,10 +314,10 @@ class TwilioMediaSession:
                             "transcription": {"model": self.settings.openai_transcription_model},
                             "turn_detection": {
                                 "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 450,
-                                "silence_duration_ms": 500,
-                                "idle_timeout_ms": 6000,
+                                "threshold": 0.45,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 650,
+                                "idle_timeout_ms": 3500,
                                 "interrupt_response": False,
                                 "create_response": False,
                             },
@@ -720,30 +720,38 @@ class TwilioMediaSession:
             log.warning("robotic_behavior_detected", metrics=metrics)
 
     def _build_response_instructions(self) -> str:
-        context = build_dynamic_response_context(
+        stage = self.customer_memory.get("conversation_stage", "INTRO")
+
+        contexts = [
             get_persona_context(),
-            "\n\n".join(
-                (
-                    get_language_context(self.customer_memory),
-                    build_memory_context(self.customer_memory),
-                    get_stage_context(self.customer_memory),
-                    get_profile_context(self.customer_memory),
-                    get_objection_context(self.customer_memory),
-                    get_lead_score_context(self.customer_memory),
-                )
-            ),
+            get_language_context(self.customer_memory),
+            build_memory_context(self.customer_memory),
+        ]
+
+        if stage == "OBJECTION_HANDLING":
+            contexts.append(get_objection_context(self.customer_memory))
+        elif stage in ("SITE_VISIT_BOOKING", "CLOSING"):
+            contexts.append(get_stage_context(self.customer_memory))
+
+        if self.customer_memory.get("callback_requested"):
+            callback_time = self.customer_memory.get("callback_time") or "unspecified time"
+            return (
+                "\n\n".join(contexts)
+                + f"\n\nCaller is busy. Confirm callback at {callback_time}.\n"
+                "Say: 'Theek hai sir, [time] pe call karti hoon. Namaste ji.' Then close."
+            )
+
+        do_not_ask = ", ".join(
+            field
+            for field in ("budget", "bhk", "location_interest", "purpose", "visit_interest")
+            if not can_ask(self.customer_memory, field)
         )
-        do_not_ask = ", ".join(field for field in ("budget", "bhk", "location_interest", "purpose", "visit_interest") if not can_ask(self.customer_memory, field))
+
         return (
-            f"{context}\n\n"
-            "Now answer the caller's latest message only.\n"
-            "Use the locked language. Speak like a local property consultant on phone.\n"
-            "Maximum 18 words. One answer, then one small question only if useful.\n"
-            "Use simple Hinglish. Avoid brochure words and long English.\n"
-            "If audio is unclear, say: Ji sir, thoda repeat karenge?\n"
-            "If the caller asks for 1 BHK, rental, commercial, plot, shop, office, villa, or 4 BHK, say it is not confirmed and redirect to available 2 BHK or 3 BHK.\n"
-            f"Do not ask these fields again: {do_not_ask or 'none'}.\n"
-            "Do not repeat questions listed as already asked. Prioritize site visit booking over collecting missing fields."
+            "\n\n".join(contexts)
+            + f"\n\nDo not ask: {do_not_ask or 'none'}.\n"
+            "Max 20 words. One follow-up only if useful.\n"
+            "Prioritize site visit when caller shows readiness."
         )
 
     def _build_greeting_instructions(self) -> str:
@@ -940,7 +948,7 @@ class TwilioMediaSession:
             if self.call_started_at and monotonic() - self.call_started_at >= MAX_CALL_SECONDS:
                 log.info("call_max_duration_reached", max_call_seconds=MAX_CALL_SECONDS)
                 self.close_after_current_response = True
-                await self._request_assistant_response("Theek hai sir, main details WhatsApp pe share kar deti hoon. Namaste.", reason="max_duration_close")
+                await self._request_assistant_response("Sir, main details WhatsApp pe bhej deti hoon. Namaste ji.", reason="max_duration_close")
                 continue
             if self.assistant_response_active or self.assistant_speaking or self.caller_speaking or self._greeting_locked():
                 continue
@@ -956,12 +964,9 @@ class TwilioMediaSession:
                 )
                 if self.silence_prompt_count >= MAX_SILENCE_PROMPTS:
                     self.close_after_current_response = True
-                    await self._request_assistant_response(
-                        "Theek hai sir, main details WhatsApp pe share kar deti hoon. Namaste.",
-                        reason="silence_close",
-                    )
+                    await self._request_assistant_response("Sir, main details WhatsApp pe bhej deti hoon. Namaste ji.", reason="silence_close")
                 else:
-                    await self._request_assistant_response("Hello sir, aap sun pa rahe hain?", reason="silence_watchdog")
+                    await self._request_assistant_response("Hello sir?", reason="silence_watchdog")
 
     async def _stop_after_response(self) -> None:
         await asyncio.sleep(0.8)
@@ -1104,23 +1109,12 @@ def _realtime_instructions() -> str:
         SYSTEM_PROMPT
         + "\n\n"
         + get_persona_context()
-        + "\n\nDemo call rules:\n"
-        + "- The opening greeting is sent separately by the system. Never repeat it after the first assistant message.\n"
-        + "- Default language is Hinglish, but obey explicit language changes from the caller.\n"
-        + "- After greeting, wait for the caller. Do not immediately ask another question unless the caller responds.\n"
-        + "- Keep every reply under 20 words, plus one small follow-up question only if useful.\n"
-        + "- Speak like a human caller: small pauses, simple words, no brochure tone.\n"
-        + "- Caller may speak Hindi/Hinglish with noise. Infer from short words like budget, bedroom, ready, Noida, visit.\n"
-        + "- Never give long English paragraphs, corporate wording, or multiple recommendations together.\n"
-        + "- Answer only the caller's latest intent. Never resume an interrupted sentence.\n"
-        + "- If caller asks 1 BHK, single room, PG, studio, rental, commercial, plot, shop, office, villa, or 4 BHK, do not think silently. Immediately say it is not confirmed and redirect to 2 BHK or 3 BHK.\n"
-        + "- If you are unsure, do not pause. Say: Sir exact detail WhatsApp pe confirm kara dunga.\n"
-        + "- Speak very clearly, slowly, and briefly.\n"
-        + "- Use simple Hindi-English Roman speech.\n"
-        + "- Sound like a confident real estate sales advisor, not a generic assistant.\n"
-        + "- Mention one useful property benefit when answering: budget fit, location, ready possession, connectivity, or amenities.\n"
-        + "- Do not repeat the same question if the user already answered.\n"
-        + "- If audio is unclear, ask one short clarification.\n"
+        + "\n\nCall rules:\n"
+        "- Greeting already sent. Never repeat it.\n"
+        "- Max 20 words. One question only.\n"
+        "- Natural Hinglish. No brochure words.\n"
+        "- 1 BHK available: Orchid Rs 25L, Green Valley Rs 28L.\n"
+        "- If caller busy, ask callback time and close warmly.\n"
     )
 
 

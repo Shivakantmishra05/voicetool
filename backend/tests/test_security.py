@@ -247,6 +247,22 @@ def test_fact_extractor_does_not_treat_bhk_or_sector_as_budget():
     assert extract_customer_facts("Budget around 80 lakh hai")["budget"] == "80 lakh"
 
 
+def test_fact_extractor_supports_one_bhk_and_new_projects():
+    facts = extract_customer_facts("Orchid Heights me 1 BHK chahiye")
+
+    assert facts["bhk"] == "1 BHK"
+    assert facts["project_preference"] == "Orchid Heights"
+    assert facts["location_interest"] == "Orchid Heights"
+
+
+def test_fact_extractor_captures_callback_and_current_city():
+    facts = extract_customer_facts("Abhi Gurgaon me rehta hu, kal 5 baje callback karna")
+
+    assert facts["current_city"] == "Gurgaon"
+    assert facts["callback_requested"] is True
+    assert facts["callback_time"] == "Kal 5 baje"
+
+
 def test_short_transcript_keeps_existing_conversation_stage():
     result = determine_stage_with_reason("haan", {"conversation_stage": "RECOMMENDATION"}, [])
 

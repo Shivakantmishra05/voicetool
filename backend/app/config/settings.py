@@ -26,9 +26,9 @@ class Settings(BaseSettings):
     stream_token_ttl_seconds: int = 120
 
     openai_api_key: str
-    openai_realtime_model: str = "gpt-realtime"
-    openai_realtime_voice: str = "coral"
-    openai_realtime_speed: float = 1.0
+    openai_realtime_model: str = "gpt-4o-realtime-preview"
+    openai_realtime_voice: str = "shimmer"
+    openai_realtime_speed: float = 0.92
     openai_summary_model: str = "gpt-4.1-mini"
     openai_transcription_model: str = "gpt-4o-mini-transcribe"
 
