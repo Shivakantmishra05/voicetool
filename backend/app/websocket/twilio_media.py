@@ -34,6 +34,7 @@ from app.services.crm_outbox import CRMOutbox
 from app.services.memory import ConversationMemory, ConversationState
 from app.services.supabase_crm import SupabaseCRM
 from app.telephony.stream_auth import StreamClaims, StreamTokenService
+from app.utils.audio import Pcm16ToUlaw8kTranscoder
 from app.utils.logging import call_sid_ctx, log
 
 
@@ -153,6 +154,9 @@ class TwilioMediaSession:
         self.response_create_sent_at: float | None = None
         self.greeting_response_create_at: float | None = None
         self.first_audio_delta_at: float | None = None
+        self.openai_output_audio_format: str | None = None
+        self.openai_output_audio_rate: int | None = None
+        self.openai_pcm_transcoder: Pcm16ToUlaw8kTranscoder | None = None
         self.deferred_response_instructions: str | None = None
         self.deferred_response_reason: str | None = None
         self.session_update_ack_event = asyncio.Event()
@@ -426,6 +430,7 @@ class TwilioMediaSession:
         if event_type == "session.updated":
             self.session_update_ack_at = monotonic()
             self.session_update_ack_event.set()
+            self._record_openai_audio_format(event)
             log.info(
                 "session_update_ack",
                 session_update_rtt_ms=self._elapsed_ms(self.session_update_sent_at, self.session_update_ack_at),
@@ -512,7 +517,14 @@ class TwilioMediaSession:
             self.metrics.inc("voice_stale_audio_skipped_total")
             log.info("stale_audio_skipped", response_id=response_id, reason="caller_speaking")
             return
-        if not self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": payload}}, "audio"):
+        payloads = self._twilio_safe_audio_payloads(payload, response_id=response_id)
+        if not payloads:
+            return
+        sent_count = 0
+        for safe_payload in payloads:
+            if self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": safe_payload}}, "audio"):
+                sent_count += 1
+        if sent_count == 0:
             return
         if not self.assistant_speaking:
             self._set_assistant_speaking(True, "first_audio_delta")
@@ -532,12 +544,66 @@ class TwilioMediaSession:
             if first_audio_ms is not None:
                 self.metrics.observe_ms("first_audio", first_audio_ms)
             log.info("assistant_audio_first_delta", response_id=self.current_response_id)
-        self.twilio_media_sent_count += 1
+        self.twilio_media_sent_count += sent_count
         response_key = response_id or self.current_response_id
         if response_key:
-            self.response_audio_sent_counts[response_key] = self.response_audio_sent_counts.get(response_key, 0) + 1
+            self.response_audio_sent_counts[response_key] = self.response_audio_sent_counts.get(response_key, 0) + sent_count
         self.last_assistant_audio_at = monotonic()
-        self.metrics.inc("voice_twilio_media_sent_total")
+        for _ in range(sent_count):
+            self.metrics.inc("voice_twilio_media_sent_total")
+
+    def _record_openai_audio_format(self, event: dict) -> None:
+        output = (((event.get("session") or {}).get("audio") or {}).get("output") or {})
+        audio_format = output.get("format") or {}
+        self.openai_output_audio_format = str(audio_format.get("type") or "").lower() or None
+        rate = audio_format.get("rate")
+        self.openai_output_audio_rate = int(rate) if str(rate or "").isdigit() else None
+        if self.openai_output_audio_format == "audio/pcm":
+            self.openai_pcm_transcoder = Pcm16ToUlaw8kTranscoder(input_sample_rate=self.openai_output_audio_rate or 24000)
+        else:
+            self.openai_pcm_transcoder = None
+        log.info(
+            "openai_audio_format_verified",
+            output_format=self.openai_output_audio_format,
+            output_rate=self.openai_output_audio_rate,
+            twilio_passthrough=self.openai_output_audio_format == "audio/pcmu",
+            transcoding_to_twilio=self.openai_output_audio_format == "audio/pcm",
+        )
+        if self.openai_output_audio_format and self.openai_output_audio_format != "audio/pcmu":
+            log.warning(
+                "openai_audio_format_not_twilio_native",
+                output_format=self.openai_output_audio_format,
+                output_rate=self.openai_output_audio_rate,
+                action="transcode_to_mulaw_8000",
+            )
+
+    def _twilio_safe_audio_payloads(self, payload: str, *, response_id: str | None = None) -> list[str]:
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except Exception:
+            self.metrics.inc("voice_bad_media_payload_total")
+            log.warning("openai_audio_payload_invalid", response_id=response_id)
+            return []
+
+        if self.twilio_media_sent_count == 0:
+            log.info(
+                "openai_audio_first_payload",
+                response_id=response_id,
+                bytes=len(raw),
+                output_format=self.openai_output_audio_format,
+                output_rate=self.openai_output_audio_rate,
+            )
+
+        if self.openai_output_audio_format == "audio/pcm":
+            if not self.openai_pcm_transcoder:
+                self.openai_pcm_transcoder = Pcm16ToUlaw8kTranscoder(input_sample_rate=self.openai_output_audio_rate or 24000)
+            frames = self.openai_pcm_transcoder.transcode_chunk_to_base64_frames(raw)
+            if not frames:
+                return []
+            self.metrics.inc("voice_openai_pcm_transcoded_total")
+            return frames
+
+        return [payload]
 
     async def _send_twilio_mark(self, response_id: str) -> None:
         if not self.state or not self.state.stream_sid:

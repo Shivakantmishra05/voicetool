@@ -6,8 +6,9 @@ MU_LAW_CLIP = 32635
 
 class Pcm16ToUlaw8kTranscoder:
     def __init__(self, input_sample_rate: int = 16000):
-        if input_sample_rate != 16000:
-            raise ValueError("only 16 kHz PCM input is supported")
+        if input_sample_rate not in {8000, 16000, 24000}:
+            raise ValueError("only 8 kHz, 16 kHz, and 24 kHz PCM input is supported")
+        self._samples_per_output = input_sample_rate // 8000
         self._pending = b""
         self._ulaw_buffer = bytearray()
 
@@ -15,15 +16,17 @@ class Pcm16ToUlaw8kTranscoder:
         if not chunk:
             return []
         raw = self._pending + chunk
-        usable = len(raw) - (len(raw) % 4)
+        block_bytes = self._samples_per_output * 2
+        usable = len(raw) - (len(raw) % block_bytes)
         self._pending = raw[usable:]
         if usable <= 0:
             return []
 
-        for offset in range(0, usable, 4):
-            first = int.from_bytes(raw[offset : offset + 2], "little", signed=True)
-            second = int.from_bytes(raw[offset + 2 : offset + 4], "little", signed=True)
-            self._ulaw_buffer.append(linear16_to_ulaw((first + second) // 2))
+        for offset in range(0, usable, block_bytes):
+            total = 0
+            for sample_offset in range(offset, offset + block_bytes, 2):
+                total += int.from_bytes(raw[sample_offset : sample_offset + 2], "little", signed=True)
+            self._ulaw_buffer.append(linear16_to_ulaw(total // self._samples_per_output))
 
         return self._pop_frames(frame_bytes)
 

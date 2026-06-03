@@ -29,6 +29,7 @@ from app.services.stt import DeepgramSTTStream
 from app.telephony.twilio import inbound_stream_twiml
 from app.telephony.stream_auth import StreamTokenError
 from app.utils.text import sanitize_tts
+from app.utils.audio import Pcm16ToUlaw8kTranscoder
 from app.observability.metrics import Metrics
 from app.websocket.twilio_media import ALLOWED_PHASE_TRANSITIONS, CallPhase, TwilioMediaSession
 
@@ -99,6 +100,14 @@ def test_sanitize_tts_removes_markup_and_limits_words():
     assert "*" not in sanitized
     assert "\n" not in sanitized
     assert len(sanitized.split()) == 35
+
+
+def test_pcm24k_transcoder_outputs_twilio_sized_ulaw_frame():
+    transcoder = Pcm16ToUlaw8kTranscoder(input_sample_rate=24000)
+    # 60 ms of little-endian PCM silence at 24 kHz = 1440 samples.
+    payloads = transcoder.transcode_chunk_to_base64_frames(b"\x00\x00" * 1440)
+
+    assert len(payloads) == 3
 
 
 def test_invalid_voice_state_regression_is_not_allowed():
