@@ -38,11 +38,13 @@ from app.utils.logging import call_sid_ctx, log
 
 
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
-GREETING = "Namaste sir, main Riya Sharma DreamHome Properties se bol rahi hoon. Aap flat dekh rahe hain?"
-GREETING_LOCK_SECONDS = 2.5
+GREETING = "Namaste ji, Riya DreamHome se bol rahi hoon. Flat ke liye enquiry thi na?"
+GREETING_LOCK_SECONDS = 1.8
 BARGE_IN_DEBOUNCE_SECONDS = 0.3
 RESPONSE_AUDIO_TIMEOUT_SECONDS = 2.0
-SILENCE_PROMPT_SECONDS = 10.0
+SILENCE_PROMPT_SECONDS = 7.0
+MAX_SILENCE_PROMPTS = 2
+MAX_CALL_SECONDS = 180.0
 OPENAI_CONNECT_TIMEOUT_SECONDS = 3.5
 SESSION_UPDATE_ACK_TIMEOUT_SECONDS = 2.0
 EARLY_AUDIO_BUFFER_FRAMES = 300
@@ -136,6 +138,8 @@ class TwilioMediaSession:
         self.caller_speech_started_at: float | None = None
         self.last_activity_at = monotonic()
         self.last_assistant_audio_at = 0.0
+        self.silence_prompt_count = 0
+        self.close_after_current_response = False
         self._barge_in_task: asyncio.Task | None = None
         self.customer_memory: dict[str, Any] = {}
         self.call_started_at: float | None = None
@@ -310,9 +314,9 @@ class TwilioMediaSession:
                             "transcription": {"model": self.settings.openai_transcription_model},
                             "turn_detection": {
                                 "type": "server_vad",
-                                "threshold": 0.65,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 800,
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 450,
+                                "silence_duration_ms": 500,
                                 "idle_timeout_ms": 6000,
                                 "interrupt_response": False,
                                 "create_response": False,
@@ -320,8 +324,8 @@ class TwilioMediaSession:
                         },
                         "output": {
                             "format": {"type": "audio/pcmu"},
-                            "voice": "marin",
-                            "speed": 0.95,
+                            "voice": self.settings.openai_realtime_voice,
+                            "speed": self.settings.openai_realtime_speed,
                         },
                     },
                 },
@@ -643,6 +647,7 @@ class TwilioMediaSession:
     async def _handle_user_transcript_locked(self, transcript: str | None) -> None:
         if not self.state or not self._add_transcript_turn("user", transcript):
             return
+        self.silence_prompt_count = 0
         self._transition(CallPhase.PROCESSING_USER, "user_transcript_completed")
         text = str(transcript or "")
         updates = extract_customer_facts(text, self.customer_memory)
@@ -732,7 +737,10 @@ class TwilioMediaSession:
         return (
             f"{context}\n\n"
             "Now answer the caller's latest message only.\n"
-            "Use the locked language. Maximum 20 words. Add one small follow-up only if needed.\n"
+            "Use the locked language. Speak like a local property consultant on phone.\n"
+            "Maximum 18 words. One answer, then one small question only if useful.\n"
+            "Use simple Hinglish. Avoid brochure words and long English.\n"
+            "If audio is unclear, say: Ji sir, thoda repeat karenge?\n"
             "If the caller asks for 1 BHK, rental, commercial, plot, shop, office, villa, or 4 BHK, say it is not confirmed and redirect to available 2 BHK or 3 BHK.\n"
             f"Do not ask these fields again: {do_not_ask or 'none'}.\n"
             "Do not repeat questions listed as already asked. Prioritize site visit booking over collecting missing fields."
@@ -753,9 +761,9 @@ class TwilioMediaSession:
             ),
         )
         instructions = (
-            f"{context}\n\n"
-            f"Start the call with exactly this short greeting, then stop: {GREETING}\n"
-            "Do not add extra questions or explanations."
+            "Say exactly this in a warm, casual Indian phone-call tone, then stop:\n"
+            f"{GREETING}\n"
+            "Do not add anything else."
         )
         log.info("greeting_instructions_preview", chars=len(instructions), preview=_preview(instructions))
         return instructions
@@ -784,6 +792,8 @@ class TwilioMediaSession:
         if response_ms is not None:
             self.metrics.observe_ms("assistant_response", response_ms)
         log.info("assistant_response_completed", response_id=response_id)
+        if self.close_after_current_response and not self.assistant_speaking and not self.pending_marks:
+            self._spawn(self._stop_after_response(), "close_after_response")
 
     async def _handle_twilio_mark(self, message: dict) -> None:
         mark_name = (message.get("mark") or {}).get("name")
@@ -812,6 +822,9 @@ class TwilioMediaSession:
                 and self.phase != CallPhase.USER_SPEAKING
                 and not self.caller_speaking
             ):
+                if self.close_after_current_response:
+                    await self._stop()
+                    return
                 await self._flush_deferred_response()
 
     async def _confirm_barge_in_after_delay(self) -> None:
@@ -924,13 +937,35 @@ class TwilioMediaSession:
     async def _silence_watchdog(self) -> None:
         while not self.stopping:
             await asyncio.sleep(2.0)
+            if self.call_started_at and monotonic() - self.call_started_at >= MAX_CALL_SECONDS:
+                log.info("call_max_duration_reached", max_call_seconds=MAX_CALL_SECONDS)
+                self.close_after_current_response = True
+                await self._request_assistant_response("Theek hai sir, main details WhatsApp pe share kar deti hoon. Namaste.", reason="max_duration_close")
+                continue
             if self.assistant_response_active or self.assistant_speaking or self.caller_speaking or self._greeting_locked():
                 continue
             idle_seconds = monotonic() - self.last_activity_at
             if idle_seconds >= SILENCE_PROMPT_SECONDS:
                 self.last_activity_at = monotonic()
-                log.info("fallback_triggered", reason="silence_watchdog", idle_seconds=round(idle_seconds, 2))
-                await self._request_assistant_response("Hello sir, am I audible?", reason="silence_watchdog")
+                self.silence_prompt_count += 1
+                log.info(
+                    "fallback_triggered",
+                    reason="silence_watchdog",
+                    idle_seconds=round(idle_seconds, 2),
+                    silence_prompt_count=self.silence_prompt_count,
+                )
+                if self.silence_prompt_count >= MAX_SILENCE_PROMPTS:
+                    self.close_after_current_response = True
+                    await self._request_assistant_response(
+                        "Theek hai sir, main details WhatsApp pe share kar deti hoon. Namaste.",
+                        reason="silence_close",
+                    )
+                else:
+                    await self._request_assistant_response("Hello sir, aap sun pa rahe hain?", reason="silence_watchdog")
+
+    async def _stop_after_response(self) -> None:
+        await asyncio.sleep(0.8)
+        await self._stop()
 
     def _greeting_locked(self) -> bool:
         return not self.greeting_completed and monotonic() < self.greeting_clear_locked_until
@@ -952,6 +987,8 @@ class TwilioMediaSession:
         self._transition(CallPhase.FAILED if failure_reason else CallPhase.COMPLETED, failure_reason or "call_completed")
         self.metrics.inc("call_failure_total" if failure_reason else "call_success_total")
         log.info("call_finished", failure_reason=failure_reason)
+        with contextlib.suppress(Exception):
+            await self.websocket.close()
 
     async def _summarize_and_persist_call(self) -> dict[str, Any] | None:
         if not self.state:
@@ -1072,6 +1109,8 @@ def _realtime_instructions() -> str:
         + "- Default language is Hinglish, but obey explicit language changes from the caller.\n"
         + "- After greeting, wait for the caller. Do not immediately ask another question unless the caller responds.\n"
         + "- Keep every reply under 20 words, plus one small follow-up question only if useful.\n"
+        + "- Speak like a human caller: small pauses, simple words, no brochure tone.\n"
+        + "- Caller may speak Hindi/Hinglish with noise. Infer from short words like budget, bedroom, ready, Noida, visit.\n"
         + "- Never give long English paragraphs, corporate wording, or multiple recommendations together.\n"
         + "- Answer only the caller's latest intent. Never resume an interrupted sentence.\n"
         + "- If caller asks 1 BHK, single room, PG, studio, rental, commercial, plot, shop, office, villa, or 4 BHK, do not think silently. Immediately say it is not confirmed and redirect to 2 BHK or 3 BHK.\n"
