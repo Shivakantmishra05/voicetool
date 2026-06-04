@@ -327,9 +327,8 @@ class TwilioMediaSession:
                             },
                         },
                         "output": {
-                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "format": {"type": "audio/pcmu"},
                             "voice": self.settings.openai_realtime_voice,
-                            "speed": self.settings.openai_realtime_speed,
                         },
                     },
                 },
