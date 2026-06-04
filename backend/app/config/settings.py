@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     openai_api_key: str
     openai_realtime_model: str = "gpt-realtime"
     openai_realtime_voice: str = "shimmer"
-    openai_realtime_speed: float = 0.92
+    openai_realtime_speed: float = 1.0
     openai_summary_model: str = "gpt-4.1-mini"
     openai_transcription_model: str = "gpt-4o-mini-transcribe"
 
