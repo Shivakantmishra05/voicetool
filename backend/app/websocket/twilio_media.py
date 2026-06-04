@@ -34,7 +34,6 @@ from app.services.crm_outbox import CRMOutbox
 from app.services.memory import ConversationMemory, ConversationState
 from app.services.supabase_crm import SupabaseCRM
 from app.telephony.stream_auth import StreamClaims, StreamTokenService
-from app.utils.audio import Pcm16ToUlaw8kTranscoder
 from app.utils.logging import call_sid_ctx, log
 
 
@@ -156,7 +155,6 @@ class TwilioMediaSession:
         self.first_audio_delta_at: float | None = None
         self.openai_output_audio_format: str | None = None
         self.openai_output_audio_rate: int | None = None
-        self.openai_pcm_transcoder: Pcm16ToUlaw8kTranscoder | None = None
         self.deferred_response_instructions: str | None = None
         self.deferred_response_reason: str | None = None
         self.session_update_ack_event = asyncio.Event()
@@ -570,24 +568,19 @@ class TwilioMediaSession:
         self.openai_output_audio_format = str(audio_format.get("type") or "").lower() or None
         rate = audio_format.get("rate")
         self.openai_output_audio_rate = int(rate) if str(rate or "").isdigit() else None
-        if self.openai_output_audio_format == "audio/pcm":
-            self.openai_output_audio_rate = self.openai_output_audio_rate or 24000
-            self.openai_pcm_transcoder = Pcm16ToUlaw8kTranscoder(input_sample_rate=self.openai_output_audio_rate or 24000)
-        else:
-            self.openai_pcm_transcoder = None
         log.info(
             "openai_audio_format_verified",
             output_format=self.openai_output_audio_format,
             output_rate=self.openai_output_audio_rate,
             twilio_passthrough=self.openai_output_audio_format == "audio/pcmu",
-            transcoding_to_twilio=self.openai_output_audio_format == "audio/pcm",
+            transcoding_to_twilio=False,
         )
         if self.openai_output_audio_format and self.openai_output_audio_format != "audio/pcmu":
             log.warning(
                 "openai_audio_format_not_twilio_native",
                 output_format=self.openai_output_audio_format,
                 output_rate=self.openai_output_audio_rate,
-                action="transcode_to_mulaw_8000",
+                action="passthrough_for_debug",
             )
 
     def _twilio_safe_audio_payloads(self, payload: str, *, response_id: str | None = None) -> list[str]:
@@ -606,15 +599,6 @@ class TwilioMediaSession:
                 output_format=self.openai_output_audio_format,
                 output_rate=self.openai_output_audio_rate,
             )
-
-        if self.openai_output_audio_format == "audio/pcm":
-            if not self.openai_pcm_transcoder:
-                self.openai_pcm_transcoder = Pcm16ToUlaw8kTranscoder(input_sample_rate=self.openai_output_audio_rate or 24000)
-            frames = self.openai_pcm_transcoder.transcode_chunk_to_base64_frames(raw)
-            if not frames:
-                return []
-            self.metrics.inc("voice_openai_pcm_transcoded_total")
-            return frames
 
         return [payload]
 
