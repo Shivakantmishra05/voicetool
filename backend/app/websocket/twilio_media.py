@@ -157,6 +157,9 @@ class TwilioMediaSession:
         self.first_audio_delta_at: float | None = None
         self.openai_output_audio_format: str | None = None
         self.openai_output_audio_rate: int | None = None
+        self.active_realtime_voice = self.settings.openai_realtime_voice
+        self.voice_fallback_applied = False
+        self.openai_audio_delta_count = 0
         self.deferred_response_instructions: str | None = None
         self.deferred_response_reason: str | None = None
         self.session_update_ack_event = asyncio.Event()
@@ -290,7 +293,12 @@ class TwilioMediaSession:
             self.metrics.observe_ms("openai_connect", connect_ms)
         if self.call_started_at:
             log.info("openai_connected_latency_ms", latency_ms=round((self.openai_connected_at - self.call_started_at) * 1000, 2))
-        log.info("openai_realtime_connected", model=self.settings.openai_realtime_model)
+        log.info(
+            "openai_realtime_connected",
+            model=self.settings.openai_realtime_model,
+            voice=self.active_realtime_voice,
+            speed=self.settings.openai_realtime_speed,
+        )
         self._transition(CallPhase.OPENAI_CONNECTED, "openai_ws_connected")
         self._spawn(self._openai_loop(), "openai_realtime_receiver")
         self._spawn(self._openai_heartbeat_loop(), "openai_heartbeat")
@@ -305,35 +313,7 @@ class TwilioMediaSession:
             preview=_preview(persona_context),
         )
         log.info("session_update_instructions_preview", chars=len(session_instructions), preview=_preview(session_instructions))
-        await self._send_openai(
-            {
-                "type": "session.update",
-                "session": {
-                    "type": "realtime",
-                    "instructions": session_instructions,
-                    "output_modalities": ["audio"],
-                    "audio": {
-                        "input": {
-                            "format": {"type": "audio/pcmu"},
-                            "transcription": {"model": self.settings.openai_transcription_model},
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 450,
-                                "silence_duration_ms": 500,
-                                "idle_timeout_ms": 6000,
-                                "interrupt_response": False,
-                                "create_response": False,
-                            },
-                        },
-                        "output": {
-                            "format": {"type": "audio/pcmu"},
-                            "voice": self.settings.openai_realtime_voice,
-                        },
-                    },
-                },
-            }
-        )
+        await self._send_session_update(session_instructions, reason="initial")
         log.info(
             "session_update_sent",
             ws_to_session_update_sent_ms=self._elapsed_ms(self.openai_ws_connected_at, self.session_update_sent_at),
@@ -438,7 +418,19 @@ class TwilioMediaSession:
             )
             log.info("openai_realtime_event", openai_event=event_type)
             return
-        if event_type in {"session.created", "conversation.item.created"}:
+        if event_type == "session.created":
+            session = event.get("session") or {}
+            audio = session.get("audio") or {}
+            log.info(
+                "session_created",
+                model=self.settings.openai_realtime_model,
+                requested_voice=self.settings.openai_realtime_voice,
+                active_voice=self.active_realtime_voice,
+                input_format=(((audio.get("input") or {}).get("format") or {}).get("type")),
+                output_format=(((audio.get("output") or {}).get("format") or {}).get("type")),
+            )
+            return
+        if event_type == "conversation.item.created":
             log.info("openai_realtime_event", openai_event=event_type)
             return
         if event_type == "input_audio_buffer.speech_started":
@@ -468,6 +460,16 @@ class TwilioMediaSession:
             log.info("openai_response_event", openai_event=event_type, response_id=event.get("response_id") or (event.get("response") or {}).get("id"))
             return
         if event_type in {"response.audio.delta", "response.output_audio.delta"}:
+            self.openai_audio_delta_count += 1
+            if self.openai_audio_delta_count == 1 or self.openai_audio_delta_count % 50 == 0:
+                delta = event.get("delta") or ""
+                log.info(
+                    "response_audio_delta",
+                    response_id=event.get("response_id"),
+                    delta_count=self.openai_audio_delta_count,
+                    payload_chars=len(delta),
+                    output_format=self.openai_output_audio_format,
+                )
             await self._send_twilio_audio(event.get("delta"), response_id=event.get("response_id"))
             return
         if event_type in {"conversation.item.input_audio_transcription.completed", "input_audio_transcription.completed"}:
@@ -502,10 +504,17 @@ class TwilioMediaSession:
                 log.info("assistant_audio_done_no_twilio_audio", response_id=response_id)
             return
         if event_type == "response.done":
+            log.info(
+                "response_done",
+                response_id=event.get("response_id") or (event.get("response") or {}).get("id"),
+                status=(event.get("response") or {}).get("status"),
+                audio_delta_count=self.openai_audio_delta_count,
+            )
             self._handle_response_completed(event)
             return
         if event_type == "error":
-            log.warning("openai_realtime_error", error=event.get("error"))
+            log.warning("openai_realtime_error", error=event.get("error"), active_voice=self.active_realtime_voice)
+            await self._maybe_fallback_realtime_voice(event)
             return
         log.debug("openai_realtime_event_ignored", openai_event=event_type)
 
@@ -545,7 +554,7 @@ class TwilioMediaSession:
                     bytes=twilio_bytes,
                     source_format=self.openai_output_audio_format,
                     source_rate=self.openai_output_audio_rate,
-                    transcoded=self.openai_output_audio_format == "audio/pcm",
+                    transcoded=False,
                 )
             if self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": safe_payload}}, "audio"):
                 sent_count += 1
@@ -595,7 +604,7 @@ class TwilioMediaSession:
                 "openai_audio_format_not_twilio_native",
                 output_format=self.openai_output_audio_format,
                 output_rate=self.openai_output_audio_rate,
-                action="passthrough_for_debug",
+                action="drop_non_pcmu_audio",
             )
 
     def _twilio_safe_audio_payloads(self, payload: str, *, response_id: str | None = None) -> list[str]:
@@ -614,6 +623,18 @@ class TwilioMediaSession:
                 output_format=self.openai_output_audio_format,
                 output_rate=self.openai_output_audio_rate,
             )
+
+        if self.openai_output_audio_format and self.openai_output_audio_format != "audio/pcmu":
+            self.metrics.inc("voice_codec_mismatch_audio_dropped_total")
+            log.error(
+                "codec_mismatch_audio_dropped",
+                response_id=response_id,
+                output_format=self.openai_output_audio_format,
+                output_rate=self.openai_output_audio_rate,
+                expected_format="audio/pcmu",
+                bytes=len(raw),
+            )
+            return []
 
         return [payload]
 
@@ -638,6 +659,74 @@ class TwilioMediaSession:
         if not self.openai_ws:
             raise RuntimeError("OpenAI realtime websocket is not connected")
         await self.openai_ws.send(json.dumps(event))
+
+    async def _send_session_update(self, session_instructions: str, *, reason: str) -> None:
+        log.info(
+            "session_update_config",
+            reason=reason,
+            model=self.settings.openai_realtime_model,
+            voice=self.active_realtime_voice,
+            speed=self.settings.openai_realtime_speed,
+            input_format="audio/pcmu",
+            output_format="audio/pcmu",
+            transcription_model=self.settings.openai_transcription_model,
+        )
+        await self._send_openai(
+            {
+                "type": "session.update",
+                "session": {
+                    "type": "realtime",
+                    "instructions": session_instructions,
+                    "output_modalities": ["audio"],
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcmu"},
+                            "transcription": {"model": self.settings.openai_transcription_model},
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 450,
+                                "silence_duration_ms": 500,
+                                "idle_timeout_ms": 6000,
+                                "interrupt_response": False,
+                                "create_response": False,
+                            },
+                        },
+                        "output": {
+                            "format": {"type": "audio/pcmu"},
+                            "voice": self.active_realtime_voice,
+                        },
+                    },
+                },
+            }
+        )
+
+    async def _maybe_fallback_realtime_voice(self, event: dict) -> None:
+        if self.voice_fallback_applied or self.active_realtime_voice == "coral":
+            return
+        error_text = json.dumps(event.get("error") or event, default=str).lower()
+        voice_related = any(token in error_text for token in ("voice", "marin", "unsupported", "invalid", "session"))
+        if not voice_related:
+            return
+        previous_voice = self.active_realtime_voice
+        self.active_realtime_voice = "coral"
+        self.voice_fallback_applied = True
+        log.warning(
+            "openai_realtime_voice_fallback",
+            previous_voice=previous_voice,
+            fallback_voice=self.active_realtime_voice,
+            reason="openai_error",
+            error_preview=error_text[:300],
+        )
+        try:
+            await self._send_session_update(_realtime_instructions(), reason="voice_fallback")
+        except Exception as exc:
+            log.exception(
+                "openai_realtime_voice_fallback_failed",
+                previous_voice=previous_voice,
+                fallback_voice=self.active_realtime_voice,
+                error=str(exc),
+            )
 
     async def _request_assistant_response(self, instructions: str, *, reason: str, force: bool = False) -> bool:
         allowed, blocked_reason = self._response_gate(reason=reason, force=force)
@@ -828,7 +917,9 @@ class TwilioMediaSession:
         return (
             "\n\n".join(contexts)
             + f"\n\nDo not ask: {do_not_ask or 'none'}.\n"
-            "Max 20 words. One follow-up only if useful.\n"
+            "Typical response 8-25 words; allow up to 35 words when needed.\n"
+            "Prefer one question at a time, but allow natural conversational flow.\n"
+            "Respond as if speaking, not writing. Use short sentences and natural pauses.\n"
             "Prioritize site visit when caller shows readiness."
         )
 
@@ -1189,7 +1280,9 @@ def _realtime_instructions() -> str:
         + get_persona_context()
         + "\n\nCall rules:\n"
         "- Greeting already sent. Never repeat it.\n"
-        "- Max 20 words. One question only.\n"
+        "- Typical response 8-25 words; allow up to 35 words when needed.\n"
+        "- Prefer one question at a time, but allow natural conversational flow.\n"
+        "- Respond as if speaking, not writing.\n"
         "- Natural Hinglish. No brochure words.\n"
         "- 1 BHK available: Orchid Rs 25L, Green Valley Rs 28L.\n"
         "- If caller busy, ask callback time and close warmly.\n"

@@ -230,6 +230,17 @@ def test_greeting_warmup_chunks_are_dropped_before_twilio_send():
     assert enqueued["count"] == 0
 
 
+def test_non_pcmu_openai_audio_is_not_forwarded_to_twilio():
+    session = object.__new__(TwilioMediaSession)
+    session.metrics = Metrics()
+    session.twilio_media_sent_count = 0
+    session.openai_output_audio_format = "audio/pcm"
+    session.openai_output_audio_rate = 24000
+
+    assert session._twilio_safe_audio_payloads("AAAA", response_id="resp_pcm") == []
+    assert session.metrics.counters["voice_codec_mismatch_audio_dropped_total"] == 1
+
+
 def test_user_transcript_response_is_deferred_while_caller_speaking():
     session = object.__new__(TwilioMediaSession)
     session.greeting_completed = True

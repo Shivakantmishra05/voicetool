@@ -30,6 +30,12 @@ configure_logging(settings.log_level)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.validate_startup()
+    log.info(
+        "openai_realtime_config",
+        model=settings.openai_realtime_model,
+        voice=settings.openai_realtime_voice,
+        speed=settings.openai_realtime_speed,
+    )
     await init_db()
     memory = ConversationMemory(settings)
     await memory.connect()
