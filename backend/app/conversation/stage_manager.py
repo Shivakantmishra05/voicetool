@@ -47,7 +47,7 @@ def determine_stage_with_reason(
     # Too short to make a decision — keep current
     if len(lowered.strip()) < 15:
         stage = current if current in STAGES else "INTRO"
-        return {"stage": stage, "reason": "short_transcript_keep_current", "confidence": 0.0}
+        return {"stage": stage, "reason": "short_transcript_keep_current_stage", "confidence": 0.0}
 
     # ── Hard exits — genuine goodbye signals only ────────────────
     # "abhi nahi" is NOT a goodbye — it's an objection. Only explicit goodbye phrases trigger CLOSING.

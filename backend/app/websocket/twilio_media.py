@@ -944,9 +944,9 @@ class TwilioMediaSession:
         # Inject the customer name from memory, fall back to "aap" so the
         # sentence stays grammatical even if the name hasn't been loaded yet.
         customer_name = (
-            str(self.customer_memory.get("name") or "").strip()
-            or self.claims.customer_name  # populated from the outbound call metadata
-            or "aap"
+            str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
+            or getattr(self.claims, "customer_name", None)
+            or "Shivakant Mishra"
         )
         confirm_line = OUTGOING_CONFIRM_LINE.format(customer_name=customer_name)
         instructions = (

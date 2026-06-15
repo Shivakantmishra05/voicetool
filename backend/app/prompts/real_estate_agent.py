@@ -197,12 +197,12 @@ Isliye log tujh pe trust karte hain.
 
 # ── Greetings ──────────────────────────────────────────────
 
-OUTGOING_CONFIRM_LINE = "Namaste, Riya bol rahi hoon DreamHome se — {customer_name} ji se baat ho rahi hai?"
+OUTGOING_CONFIRM_LINE = "Namaste sir, kya meri baat {customer_name} ji se ho rahi hai?"
 
 OUTGOING_INTRO_LINE = (
-    "DreamHome Properties se bol rahi hoon — "
-    "aapne property ke liye enquiry ki thi. "
-    "Abhi thodi der baat ho sakti hai?"
+    "Main Riya bol rahi hoon DreamHome Properties se. "
+    "Aapki property enquiry receive hui thi. "
+    "Kya abhi do minute baat kar sakte hain?"
 )
 
 INCOMING_GREETING = "Haan ji, DreamHome Properties. Bataiye?"
