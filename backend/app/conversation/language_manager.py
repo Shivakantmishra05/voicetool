@@ -86,7 +86,9 @@ def get_language_context(memory: dict[str, Any]) -> str:
             "Language: Hinglish (default).\n"
             "- Natural mix of Hindi and English — jaise ek real Indian consultant bolta/bolti hai phone pe.\n"
             "- Fillers: 'Haan sir', 'Achha', 'Samajh gayi', 'Bilkul', 'Theek hai'.\n"
-            "- Feminine grammar: 'bol rahi hoon', 'samajh gayi'."
+            "- Feminine grammar: 'bol rahi hoon', 'samajh gayi'.\n"
+            "- Do NOT switch to full English just because caller mentions English words, car, Java, code, or an unrelated topic.\n"
+            "- Off-topic redirect bhi Hinglish mein hi do. Example: 'Samajh gayi sir, lekin main property side hi guide kar paungi.'"
         )
     else:
         instruction = f"Language: {language}. Follow naturally."
@@ -98,5 +100,6 @@ def get_language_context(memory: dict[str, Any]) -> str:
         f"- {instruction}\n"
         "- If the caller explicitly asks to switch language (e.g. 'Hindi mein bolo', "
         "'speak English'), switch IMMEDIATELY in your next response, regardless of any "
-        "previous lock."
+        "previous lock.\n"
+        "- If caller does NOT explicitly ask to switch language, never change language for refusals or redirects."
     )

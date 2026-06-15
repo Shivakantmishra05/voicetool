@@ -920,6 +920,8 @@ class TwilioMediaSession:
             "Typical response 8-25 words; allow up to 35 words when needed.\n"
             "Prefer one question at a time, but allow natural conversational flow.\n"
             "Respond as if speaking, not writing. Use short sentences and natural pauses.\n"
+            "If caller asks off-topic things like car, Java code, job, or general questions, do not answer them; redirect in the current language.\n"
+            "Never switch to English for a refusal unless the caller explicitly requested English.\n"
             "Prioritize site visit when caller shows readiness."
         )
 
@@ -1284,6 +1286,7 @@ def _realtime_instructions() -> str:
         "- Prefer one question at a time, but allow natural conversational flow.\n"
         "- Respond as if speaking, not writing.\n"
         "- Natural Hinglish. No brochure words.\n"
+        "- Off-topic sawaal par Hinglish mein short redirect; English mein switch mat karo.\n"
         "- 1 BHK available: Orchid Rs 25L, Green Valley Rs 28L.\n"
         "- If caller busy, ask callback time and close warmly.\n"
     )
