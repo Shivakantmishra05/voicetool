@@ -1,9 +1,8 @@
 from __future__ import annotations
-
 from typing import Any
 
-
-FILLERS = ("haan ji", "bilkul", "achha", "theek hai", "ek second", "samajh gaya")
+# Fixed: "samajh gaya" was masculine — changed to "samajh gayi"
+FILLERS = ("haan ji", "bilkul", "achha", "theek hai", "ek second", "samajh gayi")
 
 
 def default_metrics() -> dict[str, Any]:
@@ -43,7 +42,9 @@ def user_turn_metrics(memory: dict[str, Any], text: str, objections: list[str] |
     return metrics
 
 
-def assistant_turn_metrics(memory: dict[str, Any], text: str, *, response_latency_ms: float | None = None) -> dict[str, Any]:
+def assistant_turn_metrics(
+    memory: dict[str, Any], text: str, *, response_latency_ms: float | None = None
+) -> dict[str, Any]:
     metrics = default_metrics()
     metrics.update(memory.get("conversation_metrics") or {})
     lowered = str(text or "").lower()
@@ -53,12 +54,13 @@ def assistant_turn_metrics(memory: dict[str, Any], text: str, *, response_latenc
     previous_avg = float(metrics.get("average_response_words") or 0)
     metrics["assistant_turns"] = assistant_turns
     metrics["total_turns"] += 1
-    metrics["average_response_words"] = round(((previous_avg * (assistant_turns - 1)) + word_count) / assistant_turns, 2)
+    metrics["average_response_words"] = round(
+        ((previous_avg * (assistant_turns - 1)) + word_count) / assistant_turns, 2
+    )
     if response_latency_ms is not None:
         previous_latency = float(metrics.get("average_response_latency") or 0)
         metrics["average_response_latency"] = round(
-            ((previous_latency * (assistant_turns - 1)) + response_latency_ms) / assistant_turns,
-            2,
+            ((previous_latency * (assistant_turns - 1)) + response_latency_ms) / assistant_turns, 2
         )
     metrics["filler_usage_count"] += sum(1 for filler in FILLERS if filler in lowered)
     questions = lowered.count("?")
@@ -68,7 +70,7 @@ def assistant_turn_metrics(memory: dict[str, Any], text: str, *, response_latenc
         metrics["site_visit_attempts"] += 1
     if "whatsapp" in lowered:
         metrics["whatsapp_offer_attempts"] += 1
-    if questions > 2 or word_count > 35:
+    # Flag robotic behavior — more than 1 question or very long response
+    if questions > 1 or word_count > 40:
         metrics["robotic_behavior_detected"] = True
     return metrics
-
