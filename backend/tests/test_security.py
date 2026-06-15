@@ -206,6 +206,30 @@ def test_audio_delta_is_skipped_while_caller_is_speaking():
     assert session.metrics.counters["voice_stale_audio_skipped_total"] == 1
 
 
+def test_greeting_warmup_chunks_are_dropped_before_twilio_send():
+    session = object.__new__(TwilioMediaSession)
+    session.state = SimpleNamespace(stream_sid="MZ123")
+    session.greeting_response_id = "resp_greeting"
+    session.greeting_completed = False
+    session.greeting_warmup_chunks_to_drop = 3
+    session.greeting_warmup_chunks_dropped = 0
+    session.caller_speaking = False
+    session.phase = CallPhase.ASSISTANT_SPEAKING
+    session.metrics = Metrics()
+    enqueued = {"count": 0}
+
+    def enqueue(*_):
+        enqueued["count"] += 1
+        return True
+
+    session._enqueue_twilio_message = enqueue
+
+    asyncio.run(session._send_twilio_audio("payload", response_id="resp_greeting"))
+
+    assert session.greeting_warmup_chunks_dropped == 1
+    assert enqueued["count"] == 0
+
+
 def test_user_transcript_response_is_deferred_while_caller_speaking():
     session = object.__new__(TwilioMediaSession)
     session.greeting_completed = True

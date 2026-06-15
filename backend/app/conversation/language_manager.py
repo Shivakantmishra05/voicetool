@@ -9,9 +9,9 @@ def detect_language_update(text: str, memory: dict[str, Any]) -> dict[str, Any]:
     Detects if user wants to change language.
     Returns update dict — empty dict means no change needed.
 
-    FIX: Previously language lock was set but persona fillers were still
-    in Hinglish. Now the language field is properly propagated so
-    get_persona_context() can switch fillers accordingly.
+    FIX: Explicit language requests ALWAYS override the current lock,
+    even if a language was locked earlier. This allows customers to
+    switch Hindi -> English -> Hindi freely during the call.
     """
     lowered = str(text or "").lower()
 
@@ -20,6 +20,7 @@ def detect_language_update(text: str, memory: dict[str, Any]) -> dict[str, Any]:
         "english please", "speak english", "in english",
         "english me", "english mein", "english bol",
         "let's speak english", "talk in english",
+        "english mein bolo", "english mein bole",
     )):
         return {"language": "english", "language_locked": True}
 
@@ -28,20 +29,21 @@ def detect_language_update(text: str, memory: dict[str, Any]) -> dict[str, Any]:
         "hindi me", "hindi mein", "continue in hindi",
         "speak hindi", "hindi please", "hindi bol",
         "hindi mein baat", "hindi me baat",
+        "hindi mein bolo", "hindi mein bole",
     )):
         return {"language": "hindi", "language_locked": True}
 
     # Hinglish request
     if any(phrase in lowered for phrase in (
         "hinglish", "mix language", "hindi english mix",
+        "hinglish mein", "hinglish me",
     )):
         return {"language": "hinglish", "language_locked": True}
 
-    # Language already locked — don't override
-    if memory.get("language_locked"):
-        return {}
-
-    # No change
+    # No explicit request — keep current language, no change.
+    # NOTE: Previously this returned early when language_locked was True,
+    # which permanently blocked switching back. That early-return is
+    # intentionally removed so the explicit checks above always apply.
     return {}
 
 
@@ -66,14 +68,18 @@ def get_language_context(memory: dict[str, Any]) -> str:
             "- Do NOT use 'Haan', 'Ji', 'Sir', 'Achha', 'Theek hai' or any Hindi filler.\n"
             "- Sound like a warm, confident Indian woman speaking fluent English.\n"
             "- Use natural English reactions: 'Right.', 'Got it.', 'Makes sense.', 'Sure thing.'\n"
-            "- Keep same personality — warm, direct, consultative."
+            "- Keep same personality — warm, direct, consultative.\n"
+            "- IMPORTANT: If the caller switches back to Hindi/Hinglish, follow them immediately "
+            "in your NEXT response — do not stay stuck in English."
         )
     elif language == "hindi" and locked:
         instruction = (
             "STRICT HINDI MODE (locked by user):\n"
             "- Bol poori tarah Hindi mein. Koi English word mat use karo.\n"
             "- Fillers: 'Haan ji', 'Achha', 'Samajh gayi', 'Bilkul'.\n"
-            "- Feminine grammar zaroori: 'bol rahi hoon', 'samajh gayi'."
+            "- Feminine grammar zaroori: 'bol rahi hoon', 'samajh gayi'.\n"
+            "- IMPORTANT: Agar caller English mein switch kare, turant English mein "
+            "respond karo apne next turn mein — Hindi mein atke mat raho."
         )
     elif language == "hinglish":
         instruction = (
@@ -89,5 +95,8 @@ def get_language_context(memory: dict[str, Any]) -> str:
         "Language State:\n"
         f"- Current language: {language}\n"
         f"- Language locked: {locked}\n"
-        f"- {instruction}"
+        f"- {instruction}\n"
+        "- If the caller explicitly asks to switch language (e.g. 'Hindi mein bolo', "
+        "'speak English'), switch IMMEDIATELY in your next response, regardless of any "
+        "previous lock."
     )

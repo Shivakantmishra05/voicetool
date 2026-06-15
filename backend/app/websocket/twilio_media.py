@@ -124,6 +124,8 @@ class TwilioMediaSession:
         self.greeting_clear_locked_until = 0.0
         self.greeting_response_id: str | None = None
         self.greeting_completed = False
+        self.greeting_warmup_chunks_to_drop = 3
+        self.greeting_warmup_chunks_dropped = 0
         self.assistant_response_active = False
         self.assistant_speaking = False
         self.current_response_id: str | None = None
@@ -509,6 +511,19 @@ class TwilioMediaSession:
 
     async def _send_twilio_audio(self, payload: str | None, *, response_id: str | None = None) -> None:
         if not payload or not self.state or not self.state.stream_sid:
+            return
+        if (
+            response_id == getattr(self, "greeting_response_id", None)
+            and not getattr(self, "greeting_completed", False)
+            and getattr(self, "greeting_warmup_chunks_dropped", 0) < getattr(self, "greeting_warmup_chunks_to_drop", 0)
+        ):
+            self.greeting_warmup_chunks_dropped += 1
+            log.info(
+                "greeting_warmup_chunk_dropped",
+                response_id=response_id,
+                dropped_count=self.greeting_warmup_chunks_dropped,
+                drop_limit=self.greeting_warmup_chunks_to_drop,
+            )
             return
         if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
             self.metrics.inc("voice_stale_audio_skipped_total")
