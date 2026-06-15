@@ -26,7 +26,12 @@ from app.conversation.quality_metrics import assistant_turn_metrics, user_turn_m
 from app.conversation.stage_manager import determine_stage_with_reason, get_stage_context
 from app.database.session import SessionLocal
 from app.models import Call
-from app.prompts.real_estate_agent import SYSTEM_PROMPT, build_dynamic_response_context
+from app.prompts.real_estate_agent import (
+    SYSTEM_PROMPT,
+    OUTGOING_CONFIRM_LINE,
+    OUTGOING_INTRO_LINE,
+    build_dynamic_response_context,
+)
 from app.observability import Metrics
 from app.services.call_repository import CallRepository
 from app.services.call_summary import CallSummarizer
@@ -38,7 +43,6 @@ from app.utils.logging import call_sid_ctx, log
 
 
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
-GREETING = "Namaste ji, Riya DreamHome Properties se bol rahi hoon. Kya abhi 2 minute baat ho sakti hai?"
 GREETING_LOCK_SECONDS = 2.2
 BARGE_IN_DEBOUNCE_SECONDS = 0.35
 RESPONSE_AUDIO_TIMEOUT_SECONDS = 2.5
@@ -908,6 +912,17 @@ class TwilioMediaSession:
                 "Say: 'Theek hai sir, [time] pe call karti hoon. Namaste ji.' Then close."
             )
 
+        # ── First real turn: caller just confirmed their identity after the
+        #    greeting. Deliver the Step 2 intro line verbatim, then stop.
+        #    After this turn, intro_delivered is set and normal flow resumes.
+        if not self.customer_memory.get("intro_delivered"):
+            self.customer_memory["intro_delivered"] = True  # optimistic local flag
+            return (
+                "\n\n".join(contexts)
+                + "\n\nSay exactly this in a warm, natural Indian phone-call tone, then stop:\n"
+                + OUTGOING_INTRO_LINE
+            )
+
         do_not_ask = ", ".join(
             field
             for field in ("budget", "bhk", "location_interest", "purpose", "visit_interest")
@@ -926,25 +941,25 @@ class TwilioMediaSession:
         )
 
     def _build_greeting_instructions(self) -> str:
-        context = build_dynamic_response_context(
-            get_persona_context(),
-            "\n\n".join(
-                (
-                    get_language_context(self.customer_memory),
-                    build_memory_context(self.customer_memory),
-                    get_stage_context(self.customer_memory),
-                    get_profile_context(self.customer_memory),
-                    get_objection_context(self.customer_memory),
-                    get_lead_score_context(self.customer_memory),
-                )
-            ),
+        # Inject the customer name from memory, fall back to "aap" so the
+        # sentence stays grammatical even if the name hasn't been loaded yet.
+        customer_name = (
+            str(self.customer_memory.get("name") or "").strip()
+            or self.claims.customer_name  # populated from the outbound call metadata
+            or "aap"
         )
+        confirm_line = OUTGOING_CONFIRM_LINE.format(customer_name=customer_name)
         instructions = (
-            "Say exactly this in a warm, casual Indian phone-call tone, then stop:\n"
-            f"{GREETING}\n"
-            "Do not add anything else."
+            "Say exactly this one line in a warm, natural Indian phone-call tone, then stop "
+            "and wait for the caller to respond. Do not add anything else:\n"
+            f"{confirm_line}"
         )
-        log.info("greeting_instructions_preview", chars=len(instructions), preview=_preview(instructions))
+        log.info(
+            "greeting_instructions_preview",
+            customer_name=customer_name,
+            chars=len(instructions),
+            preview=_preview(instructions),
+        )
         return instructions
 
     def _handle_response_started(self, event: dict) -> None:
