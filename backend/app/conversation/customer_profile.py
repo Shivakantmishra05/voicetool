@@ -12,6 +12,8 @@ def classify_customer_profile_with_confidence(text: str, memory: dict[str, Any])
     lowered = str(text or "").lower()
     if len(lowered.strip()) < 15:
         return {"profile": "UNKNOWN", "confidence": 0.0, "reason": "short_transcript"}
+    if any(word in lowered for word in ("rental income", "rent out", "kiraye se income")):
+        return {"profile": "INVESTOR", "confidence": 0.9, "reason": "rental_income_keyword"}
     if any(word in lowered for word in ("roi", "rental yield", "investment", "invest", "appreciation")):
         return {"profile": "INVESTOR", "confidence": 0.9, "reason": "investment_keyword"}
     if any(word in lowered for word in ("family", "school", "hospital", "children", "kids", "khud", "self use", "rehne")):

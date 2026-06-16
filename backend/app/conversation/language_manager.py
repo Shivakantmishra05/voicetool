@@ -2,6 +2,18 @@ from typing import Any
 
 
 SUPPORTED_LANGUAGES = {"hinglish", "hindi", "english"}
+NEGATION_WORDS = ("mat", "nahi", "nahin", "don't", "dont", "not", "avoid")
+
+
+def _is_negated(lowered: str, keyword: str) -> bool:
+    idx = lowered.find(keyword)
+    if idx == -1:
+        return False
+    preceding = lowered[max(0, idx - 24) : idx]
+    following = lowered[idx : idx + 32]
+    return any(neg in preceding.split() for neg in NEGATION_WORDS) or any(
+        neg in following.split() for neg in NEGATION_WORDS
+    )
 
 
 def detect_language_update(text: str, memory: dict[str, Any]) -> dict[str, Any]:
@@ -16,6 +28,9 @@ def detect_language_update(text: str, memory: dict[str, Any]) -> dict[str, Any]:
     lowered = str(text or "").lower()
 
     # English request
+    if "english" in lowered and _is_negated(lowered, "english"):
+        return {"language": "hinglish", "language_locked": True}
+
     if any(phrase in lowered for phrase in (
         "english please", "speak english", "in english",
         "english me", "english mein", "english bol",

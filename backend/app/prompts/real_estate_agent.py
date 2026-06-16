@@ -77,7 +77,7 @@ CALL KI SHURUAT
 ────────────────────────────
 
 STEP 1 — Confirm karo, phir RUKO:
-  "Namaste, Riya bol rahi hoon DreamHome se — {customer_name} ji se baat ho rahi hai?"
+  "Namaste sir, kya meri baat {customer_name} ji se ho rahi hai?"
 
   → Confirm hua: Step 2.
   → Wrong number: "Oh sorry, galat ho gaya. Namaste." — khatam.

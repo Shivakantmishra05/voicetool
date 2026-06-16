@@ -1,11 +1,19 @@
 from typing import Any
 
+LINKED_FIELDS = {
+    "property_type": "bhk",
+    "bhk": "property_type",
+}
+
 
 def can_ask(memory: dict[str, Any], field: str) -> bool:
     refused = set(memory.get("refused_fields") or [])
     if field in refused:
         return False
     if memory.get(field):
+        return False
+    linked = LINKED_FIELDS.get(field)
+    if linked and memory.get(linked):
         return False
     asked = memory.get("asked_questions") or {}
     if isinstance(asked, dict):

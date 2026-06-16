@@ -11,7 +11,7 @@ def detect_objections(text: str) -> list[str]:
         found.append("PRICE")
     if any(phrase in lowered for phrase in ("location dur", "far", "door", "traffic", "area pasand nahi")):
         found.append("LOCATION")
-    if any(phrase in lowered for phrase in ("late possession", "possession late", "time lagega", "abhi nahi")):
+    if any(phrase in lowered for phrase in ("late possession", "possession late", "possession door hai", "kitne saal mein milega")):
         found.append("TIMING")
     if any(phrase in lowered for phrase in ("trust", "rera", "builder kaun", "genuine", "fraud")):
         found.append("TRUST")
@@ -19,7 +19,7 @@ def detect_objections(text: str) -> list[str]:
         found.append("COMPARISON")
     if any(phrase in lowered for phrase in ("family se", "wife se", "husband se", "parents se", "discuss")):
         found.append("FAMILY_APPROVAL")
-    if any(phrase in lowered for phrase in ("later", "baad me", "maybe later", "soch ke", "abhi nahi")):
+    if any(phrase in lowered for phrase in ("later", "baad me", "baad mein", "maybe later", "soch ke", "sochna hai", "abhi nahi")):
         found.append("WAITING")
     return found
 
@@ -37,4 +37,3 @@ def get_objection_context(memory: dict[str, Any]) -> str:
         f"- Detected: {', '.join(objections)}\n"
         "- Address only the latest relevant objection naturally. Do not argue."
     )
-

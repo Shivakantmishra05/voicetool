@@ -55,7 +55,7 @@ EARLY_AUDIO_BUFFER_FRAMES = 300
 TWILIO_OUTBOUND_QUEUE_SIZE = 1000
 OPENAI_HEARTBEAT_SECONDS = 20.0
 OPENAI_PONG_TIMEOUT_SECONDS = 10.0
-OPENAI_RECONNECT_ATTEMPTS = 1
+OPENAI_RECONNECT_ATTEMPTS = 3
 
 
 class CallPhase(StrEnum):
@@ -308,8 +308,9 @@ class TwilioMediaSession:
         self._spawn(self._openai_heartbeat_loop(), "openai_heartbeat")
         self.session_update_sent_at = monotonic()
         self._transition(CallPhase.SESSION_UPDATING, "session_update_sent")
-        session_instructions = _realtime_instructions()
-        persona_context = get_persona_context()
+        language = self.customer_memory.get("language", "hinglish")
+        session_instructions = _realtime_instructions(language)
+        persona_context = get_persona_context(language)
         log.info(
             "persona_context_loaded",
             persona_source_file=inspect.getsourcefile(persona_module),
@@ -723,7 +724,10 @@ class TwilioMediaSession:
             error_preview=error_text[:300],
         )
         try:
-            await self._send_session_update(_realtime_instructions(), reason="voice_fallback")
+            await self._send_session_update(
+                _realtime_instructions(self.customer_memory.get("language", "hinglish")),
+                reason="voice_fallback",
+            )
         except Exception as exc:
             log.exception(
                 "openai_realtime_voice_fallback_failed",
@@ -892,14 +896,15 @@ class TwilioMediaSession:
 
     def _build_response_instructions(self) -> str:
         stage = self.customer_memory.get("conversation_stage", "INTRO")
+        language = self.customer_memory.get("language", "hinglish")
 
         contexts = [
-            get_persona_context(),
+            get_persona_context(language),
             get_language_context(self.customer_memory),
             build_memory_context(self.customer_memory),
         ]
 
-        if stage == "OBJECTION_HANDLING":
+        if self.customer_memory.get("objections"):
             contexts.append(get_objection_context(self.customer_memory))
         elif stage in ("SITE_VISIT_BOOKING", "CLOSING"):
             contexts.append(get_stage_context(self.customer_memory))
@@ -932,12 +937,11 @@ class TwilioMediaSession:
         return (
             "\n\n".join(contexts)
             + f"\n\nDo not ask: {do_not_ask or 'none'}.\n"
-            "Typical response 8-25 words; allow up to 35 words when needed.\n"
-            "Prefer one question at a time, but allow natural conversational flow.\n"
-            "Respond as if speaking, not writing. Use short sentences and natural pauses.\n"
-            "If caller asks off-topic things like car, Java code, job, or general questions, do not answer them; redirect in the current language.\n"
-            "Never switch to English for a refusal unless the caller explicitly requested English.\n"
-            "Prioritize site visit when caller shows readiness."
+            "Jo pata hai — mat poochho dobara. Yeh sabse important hai.\n"
+            "React pehle, phir respond. Short. Silence se mat ghabrao.\n"
+            "Objection aayi — pehle acknowledge karo, turant counter mat karo.\n"
+            "Hot lead hai (budget+BHK+visit known) — visit book karo, aur kuch mat poochho.\n"
+            "Off-topic ho to current language mein softly redirect karo."
         )
 
     def _build_greeting_instructions(self) -> str:
@@ -1109,7 +1113,7 @@ class TwilioMediaSession:
             self.openai_reconnect_attempts += 1
             self.metrics.inc("openai_reconnect_total")
             log.info("openai_reconnect_started", reason=reason, attempt=self.openai_reconnect_attempts, phase=self.phase.value)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(min(4.0, 2 ** (self.openai_reconnect_attempts - 1)))
             await self._connect_openai(request_greeting=False)
         finally:
             self.openai_recovering = False
@@ -1290,18 +1294,17 @@ class TwilioMediaSession:
                 await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=self.settings.provider_cleanup_timeout_seconds)
 
 
-def _realtime_instructions() -> str:
+def _realtime_instructions(language: str = "hinglish") -> str:
     return (
         SYSTEM_PROMPT
         + "\n\n"
-        + get_persona_context()
+        + get_persona_context(language)
         + "\n\nCall rules:\n"
         "- Greeting already sent. Never repeat it.\n"
-        "- Typical response 8-25 words; allow up to 35 words when needed.\n"
-        "- Prefer one question at a time, but allow natural conversational flow.\n"
-        "- Respond as if speaking, not writing.\n"
-        "- Natural Hinglish. No brochure words.\n"
-        "- Off-topic sawaal par Hinglish mein short redirect; English mein switch mat karo.\n"
+        "- React pehle, phir respond. Short rakhna.\n"
+        "- Silence se mat ghabrao. Pressure mat daalo.\n"
+        "- Current language mein raho unless caller explicitly switches.\n"
+        "- Off-topic sawaal par same language mein short redirect.\n"
         "- 1 BHK available: Orchid Rs 25L, Green Valley Rs 28L.\n"
         "- If caller busy, ask callback time and close warmly.\n"
     )

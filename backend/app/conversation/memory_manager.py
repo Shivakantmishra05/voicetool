@@ -38,6 +38,8 @@ DEFAULT_MEMORY: dict[str, Any] = {
     "callback_time": None,
     # Conversation state
     "conversation_stage": "INTRO",
+    "not_interested_count": 0,
+    "intro_delivered": False,
     "objections": [],
     "lead_score": 0,
     "decision_maker": None,
@@ -137,6 +139,12 @@ class CallMemoryManager:
             if field == "lead_score" and value != memory.get(field):
                 memory[field] = int(value or 0)
                 changed = True
+                continue
+
+            if field == "conversation_stage":
+                if _stage_can_advance(memory.get(field), value):
+                    memory[field] = value
+                    changed = True
                 continue
 
             if field in DEFAULT_MEMORY and value is not None and _is_more_specific(value, memory.get(field)):
@@ -240,8 +248,30 @@ def _is_more_specific(new_value: Any, current_value: Any) -> bool:
         return True
     if str(new_value).lower() == str(current_value).lower():
         return False
-    if current_value in {"INTRO", "DISCOVERY", "RECOMMENDATION", "OBJECTION_HANDLING", "SITE_VISIT_BOOKING", "CLOSING"}:
-        return True
     if str(current_value).upper() in {"UNKNOWN", "SELF_USE", "INVESTOR", "BROKER", "TENANT", "EXPLORING"}:
         return str(new_value).upper() not in {"UNKNOWN", "EXPLORING"} or str(current_value).upper() == "UNKNOWN"
     return len(str(new_value)) >= len(str(current_value))
+
+
+STAGE_ORDER = {
+    "INTRO": 0,
+    "DISCOVERY": 1,
+    "RECOMMENDATION": 2,
+    "OBJECTION_HANDLING": 2,
+    "SITE_VISIT_BOOKING": 3,
+    "CLOSING": 4,
+}
+
+TERMINAL_STAGES = {"SITE_VISIT_BOOKING", "CLOSING"}
+
+
+def _stage_can_advance(current_value: Any, new_value: Any) -> bool:
+    current = str(current_value or "INTRO")
+    new = str(new_value or "")
+    if new not in STAGE_ORDER:
+        return False
+    if current == new:
+        return False
+    if current in TERMINAL_STAGES:
+        return False
+    return STAGE_ORDER.get(new, 0) >= STAGE_ORDER.get(current, 0)

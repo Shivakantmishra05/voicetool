@@ -20,6 +20,12 @@ FACT_FIELDS = (
     "callback_time",
 )
 
+AGENT_NAMES = {"riya", "riya sharma", "dreamhome", "dreamhome properties"}
+BUDGET_CONTEXT_WORDS = (
+    "budget", "price", "range", "cost", "rate", "under", "around",
+    "tak", "mein", "ke andar", "lakh", "lac", "crore", "cr"
+)
+
 
 def extract_customer_facts(text: str, current_memory: dict[str, Any] | None = None) -> dict[str, Any]:
     cleaned = _normalize(text)
@@ -56,7 +62,8 @@ def _extract_name(text: str, updates: dict[str, Any]) -> None:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             name = _title(match.group(1))
-            if name and name.lower() not in {
+            normalized_name = name.lower()
+            if name and normalized_name not in AGENT_NAMES and normalized_name not in {
                 "budget", "investment", "self use", "noida", "delhi",
                 "property", "flat", "bhk", "bedroom",
             }:
@@ -78,18 +85,16 @@ def _extract_budget(text: str, updates: dict[str, Any]) -> None:
     if not match:
         return
 
-    nearby = text[max(0, match.start() - 15) : match.end() + 15].lower()
+    nearby = text[max(0, match.start() - 20) : match.end() + 20].lower()
     unit = (match.group(2) or "").lower().rstrip(".")
 
     # Skip if number is near BHK or sector references
     if any(token in nearby for token in ("bhk", "bedroom", "bed room", "sector", "floor")):
         return
 
-    # Require budget context words if no unit given
-    if not unit and not any(
-        token in text.lower()
-        for token in ("budget", "price", "range", "tak", "around", "ka", "mein")
-    ):
+    # Require a money unit or clear nearby budget context. This prevents
+    # "Sector 150" / "3 BHK" type numbers from becoming budgets.
+    if not unit and not any(token in nearby for token in BUDGET_CONTEXT_WORDS):
         return
 
     unit = unit or "lakh"

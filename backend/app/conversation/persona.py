@@ -13,14 +13,10 @@ BLOCKED_PHRASES = (
     # These reliably signal "AI or call-center bot" — keep list short
     "Certainly", "Absolutely", "Of course", "Great question",
     "Excellent", "Wonderful", "Fantastic", "Noted", "Rest assured",
-    "I have noted", "I understand your concern",
     "Thank you for your interest", "How may I assist", "How may I help",
     "Ji bataiye", "Kaise madad kar sakti hoon", "Allow me to explain",
-    "I would like to inform", "As per your requirement",
-    "As per our conversation", "I'd be happy to help",
-    "I can assist you with", "I am an AI", "As an AI",
-    "I am a language model", "I am a bot", "I don't have feelings",
-    "Please note that",
+    "As per your requirement", "I am an AI", "As an AI",
+    "I am a language model", "I am a bot",
 )
 
 NATURAL_REACTIONS = {
