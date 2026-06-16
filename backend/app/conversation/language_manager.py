@@ -27,9 +27,10 @@ def detect_language_update(text: str, memory: dict[str, Any]) -> dict[str, Any]:
     """
     lowered = str(text or "").lower()
 
-    # English request
+    # English request. Do not hard-lock forever; the next explicit language
+    # request should override immediately.
     if "english" in lowered and _is_negated(lowered, "english"):
-        return {"language": "hinglish", "language_locked": True}
+        return {"language": "hinglish", "language_locked": False}
 
     if any(phrase in lowered for phrase in (
         "english please", "speak english", "in english",
@@ -37,7 +38,7 @@ def detect_language_update(text: str, memory: dict[str, Any]) -> dict[str, Any]:
         "let's speak english", "talk in english",
         "english mein bolo", "english mein bole",
     )):
-        return {"language": "english", "language_locked": True}
+        return {"language": "english", "language_locked": False}
 
     # Hindi request
     if any(phrase in lowered for phrase in (
@@ -45,15 +46,17 @@ def detect_language_update(text: str, memory: dict[str, Any]) -> dict[str, Any]:
         "speak hindi", "hindi please", "hindi bol",
         "hindi mein baat", "hindi me baat",
         "hindi mein bolo", "hindi mein bole",
+        "हिंदी", "हिन्दी", "हिंदी में", "हिन्दी में",
+        "हिंदी में बात", "हिन्दी में बात",
     )):
-        return {"language": "hindi", "language_locked": True}
+        return {"language": "hindi", "language_locked": False}
 
     # Hinglish request
     if any(phrase in lowered for phrase in (
         "hinglish", "mix language", "hindi english mix",
         "hinglish mein", "hinglish me",
     )):
-        return {"language": "hinglish", "language_locked": True}
+        return {"language": "hinglish", "language_locked": False}
 
     # No explicit request — keep current language, no change.
     # NOTE: Previously this returned early when language_locked was True,
@@ -76,9 +79,9 @@ def get_language_context(memory: dict[str, Any]) -> str:
     if language not in SUPPORTED_LANGUAGES:
         language = "hinglish"
 
-    if language == "english" and locked:
+    if language == "english":
         instruction = (
-            "STRICT ENGLISH MODE (locked by user):\n"
+            "Current language: English.\n"
             "- Respond ONLY in English. No Hindi or Hinglish words at all.\n"
             "- Do NOT use 'Haan', 'Ji', 'Sir', 'Achha', 'Theek hai' or any Hindi filler.\n"
             "- Sound like a warm, confident Indian woman speaking fluent English.\n"
@@ -87,9 +90,9 @@ def get_language_context(memory: dict[str, Any]) -> str:
             "- IMPORTANT: If the caller switches back to Hindi/Hinglish, follow them immediately "
             "in your NEXT response — do not stay stuck in English."
         )
-    elif language == "hindi" and locked:
+    elif language == "hindi":
         instruction = (
-            "STRICT HINDI MODE (locked by user):\n"
+            "Current language: Hindi.\n"
             "- Bol poori tarah Hindi mein. Koi English word mat use karo.\n"
             "- Fillers: 'Haan ji', 'Achha', 'Samajh gayi', 'Bilkul'.\n"
             "- Feminine grammar zaroori: 'bol rahi hoon', 'samajh gayi'.\n"

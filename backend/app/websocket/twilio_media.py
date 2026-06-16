@@ -56,6 +56,36 @@ TWILIO_OUTBOUND_QUEUE_SIZE = 1000
 OPENAI_HEARTBEAT_SECONDS = 20.0
 OPENAI_PONG_TIMEOUT_SECONDS = 10.0
 OPENAI_RECONNECT_ATTEMPTS = 3
+UNSUPPORTED_AREA_RESPONSE = (
+    "Woh area hamare paas covered nahi hai abhi. Hamare projects Greater Noida West mein hain — "
+    "agar kabhi us side consider karo toh batana."
+)
+AI_IDENTITY_RESPONSE_HINDI = "Nahi sir, main Riya hoon DreamHome se."
+AI_IDENTITY_RESPONSE_ENGLISH = "No sir, this is Riya from DreamHome."
+UNSUPPORTED_INVENTORY_TERMS = (
+    "sector 62",
+    "sector-62",
+    "electronic city",
+    "saya gold",
+    "saya gold avenue",
+    "jaipuriya",
+    "jaipuriya sunrise",
+    "jaipuriya sunrise greens",
+    "purvanchal heights",
+    "mahagun",
+    "mahagun mansion",
+)
+AI_IDENTITY_TERMS = (
+    "ai bol",
+    "ai ho",
+    "ai lag",
+    "artificial intelligence",
+    "robot",
+    "bot",
+    "एआई",
+    "ए आई",
+    "AI बोल",
+)
 
 
 class CallPhase(StrEnum):
@@ -870,6 +900,15 @@ class TwilioMediaSession:
                 log.info("objection_detected", objections=objections)
         else:
             self.customer_memory = await self.call_memory.load_memory(self.state.call_sid)
+        forced_response = self._forced_safety_response(text)
+        if forced_response:
+            await self._request_assistant_response(
+                "Say exactly this one line, then stop. Do not add anything else:\n"
+                f"{forced_response}",
+                reason="forced_safety_response",
+                force=True,
+            )
+            return
         await self._request_assistant_response(
             self._build_response_instructions(),
             reason="user_transcript",
@@ -938,11 +977,27 @@ class TwilioMediaSession:
             "\n\n".join(contexts)
             + f"\n\nDo not ask: {do_not_ask or 'none'}.\n"
             "Jo pata hai — mat poochho dobara. Yeh sabse important hai.\n"
+            "Jo memory mein nahi hai, usko pehle bataya hua mat bolo.\n"
             "React pehle, phir respond. Short. Silence se mat ghabrao.\n"
             "Objection aayi — pehle acknowledge karo, turant counter mat karo.\n"
             "Hot lead hai (budget+BHK+visit known) — visit book karo, aur kuch mat poochho.\n"
+            "Ek turn mein ek hi sawaal. Budget, BHK, location ek saath mat poochho.\n"
+            "Unknown area/project par kuch invent mat karo.\n"
             "Off-topic ho to current language mein softly redirect karo."
         )
+
+    def _forced_safety_response(self, text: str) -> str | None:
+        lowered = str(text or "").lower()
+        if any(term in lowered for term in UNSUPPORTED_INVENTORY_TERMS):
+            log.warning("unsupported_inventory_forced_response", transcript_preview=_preview(text, 180))
+            return UNSUPPORTED_AREA_RESPONSE
+        if any(term.lower() in lowered for term in AI_IDENTITY_TERMS):
+            language = self.customer_memory.get("language") or "hinglish"
+            log.warning("ai_identity_forced_response", language=language, transcript_preview=_preview(text, 180))
+            if language == "english":
+                return AI_IDENTITY_RESPONSE_ENGLISH
+            return AI_IDENTITY_RESPONSE_HINDI
+        return None
 
     def _build_greeting_instructions(self) -> str:
         # Inject the customer name from memory, fall back to "aap" so the
