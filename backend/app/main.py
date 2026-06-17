@@ -35,6 +35,9 @@ async def lifespan(app: FastAPI):
         model=settings.openai_realtime_model,
         voice=settings.openai_realtime_voice,
         speed=settings.openai_realtime_speed,
+        tts_provider=settings.tts_provider,
+        cartesia_model=settings.cartesia_model_id if settings.tts_provider == "cartesia" else None,
+        cartesia_voice_id_suffix=settings.cartesia_voice_id[-6:] if settings.tts_provider == "cartesia" and settings.cartesia_voice_id else None,
     )
     await init_db()
     memory = ConversationMemory(settings)

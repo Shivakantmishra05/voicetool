@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     elevenlabs_model_id: str = "eleven_flash_v2_5"
     elevenlabs_output_format: str = "pcm_16000"
     tts_timeout_seconds: float = 8.0
+    tts_provider: str = "openai"
+    cartesia_api_key: str | None = None
+    cartesia_model_id: str = "sonic-3.5"
+    cartesia_voice_id: str | None = None
+    cartesia_version: str = "2026-03-01"
+    cartesia_language: str = "hi"
+    cartesia_sample_rate: int = 8000
 
     rate_limit_per_minute: int = 120
     call_idle_timeout_seconds: int = 45
@@ -124,12 +131,21 @@ class Settings(BaseSettings):
                 missing.append("STARTUP_PROVIDER_CHECKS_REQUIRED=true")
             if self.supabase_key and self.supabase_key.startswith("sb_publishable"):
                 missing.append("SUPABASE_KEY service-role/server key")
-        if missing:
-            raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
         if self.deepgram_utterance_end_ms < 1000:
             raise RuntimeError("DEEPGRAM_UTTERANCE_END_MS must be >= 1000 for Deepgram live streaming")
         if self.elevenlabs_output_format not in {"pcm_16000", "ulaw_8000"}:
             raise RuntimeError("ELEVENLABS_OUTPUT_FORMAT must be pcm_16000 or ulaw_8000 for Twilio playback")
+        if self.tts_provider not in {"openai", "cartesia"}:
+            raise RuntimeError("TTS_PROVIDER must be openai or cartesia")
+        if self.tts_provider == "cartesia":
+            if not self.cartesia_api_key:
+                missing.append("CARTESIA_API_KEY")
+            if not self.cartesia_voice_id:
+                missing.append("CARTESIA_VOICE_ID")
+            if self.cartesia_sample_rate != 8000:
+                raise RuntimeError("CARTESIA_SAMPLE_RATE must be 8000 for Twilio Media Streams")
+        if missing:
+            raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
     @property
     def resolved_stream_token_secret(self) -> str:

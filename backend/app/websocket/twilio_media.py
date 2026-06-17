@@ -35,6 +35,7 @@ from app.prompts.real_estate_agent import (
 from app.observability import Metrics
 from app.services.call_repository import CallRepository
 from app.services.call_summary import CallSummarizer
+from app.services.cartesia_tts import CartesiaTTS
 from app.services.crm_outbox import CRMOutbox
 from app.services.memory import ConversationMemory, ConversationState
 from app.services.supabase_crm import SupabaseCRM
@@ -146,6 +147,7 @@ class TwilioMediaSession:
         self.crm = crm
         self.crm_outbox = crm_outbox
         self.call_memory = CallMemoryManager(memory.redis)
+        self.cartesia_tts = CartesiaTTS(settings) if settings.tts_provider == "cartesia" else None
 
         self.state: ConversationState | None = None
         self.call: Call | None = None
@@ -269,6 +271,13 @@ class TwilioMediaSession:
             self.call = await repo.start_call(call_sid, stream_sid, caller)
 
         log.info("call_started", stream_sid=stream_sid, media_format=media_format, provider="openai_realtime")
+        log.info(
+            "voice_output_provider",
+            provider=self.settings.tts_provider,
+            cartesia_enabled=self.cartesia_tts is not None,
+            cartesia_model=self.settings.cartesia_model_id if self.cartesia_tts else None,
+            cartesia_voice_id_suffix=self.settings.cartesia_voice_id[-6:] if self.cartesia_tts and self.settings.cartesia_voice_id else None,
+        )
         self.openai_connect_task = self._spawn(self._connect_openai(request_greeting=True), "openai_realtime_connector")
         self._spawn(self._silence_watchdog(), "silence_watchdog")
 
@@ -496,6 +505,16 @@ class TwilioMediaSession:
             return
         if event_type in {"response.audio.delta", "response.output_audio.delta"}:
             self.openai_audio_delta_count += 1
+            if self._using_cartesia_tts():
+                if self.response_first_audio_at is None:
+                    self.response_first_audio_at = monotonic()
+                if self.openai_audio_delta_count == 1:
+                    log.info(
+                        "openai_audio_delta_ignored_for_cartesia",
+                        response_id=event.get("response_id"),
+                        output_format=self.openai_output_audio_format,
+                    )
+                return
             if self.openai_audio_delta_count == 1 or self.openai_audio_delta_count % 50 == 0:
                 delta = event.get("delta") or ""
                 log.info(
@@ -523,9 +542,14 @@ class TwilioMediaSession:
             if self._add_transcript_turn("assistant", transcript):
                 self._spawn(self._record_assistant_question(transcript), "assistant_question_recorder")
                 self._spawn(self._record_assistant_metrics(transcript), "assistant_metrics_recorder")
+                if self._using_cartesia_tts():
+                    self._spawn(self._speak_with_cartesia(transcript, response_id), "cartesia_tts_playback")
             return
         if event_type in {"response.audio.done", "response.output_audio.done"}:
             response_id = event.get("response_id") or self.current_response_id or "openai-response"
+            if self._using_cartesia_tts():
+                log.info("openai_audio_done_ignored_for_cartesia", response_id=response_id)
+                return
             response_media_sent = self.response_audio_sent_counts.pop(response_id, 0)
             log.info(
                 "assistant_audio_finished",
@@ -672,6 +696,75 @@ class TwilioMediaSession:
             return []
 
         return [payload]
+
+    def _using_cartesia_tts(self) -> bool:
+        return getattr(self, "cartesia_tts", None) is not None
+
+    async def _speak_with_cartesia(self, transcript: str | None, response_id: str | None) -> None:
+        text = " ".join(str(transcript or "").split())
+        if not text or not self.cartesia_tts or not self.state or self.stopping:
+            return
+        if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
+            log.info("cartesia_tts_skipped", response_id=response_id, reason="caller_speaking")
+            return
+        started = monotonic()
+        try:
+            ulaw_audio = await self.cartesia_tts.synthesize_ulaw(text, call_sid=self.state.call_sid)
+        except Exception as exc:
+            log.exception("cartesia_tts_playback_failed", response_id=response_id, error=str(exc))
+            self.metrics.inc("cartesia_tts_failure_total")
+            return
+        self.metrics.inc("cartesia_tts_success_total")
+        log.info(
+            "cartesia_tts_latency",
+            response_id=response_id,
+            latency_ms=self._elapsed_ms(started, monotonic()),
+            audio_bytes=len(ulaw_audio),
+        )
+        await self._send_twilio_ulaw_audio(ulaw_audio, response_id=response_id or self.current_response_id or "cartesia-response")
+
+    async def _send_twilio_ulaw_audio(self, audio: bytes, *, response_id: str) -> None:
+        if not audio or not self.state or not self.state.stream_sid:
+            return
+        if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
+            log.info("cartesia_audio_skipped", response_id=response_id, reason="caller_speaking")
+            return
+        sent_count = 0
+        chunk_size = 160
+        for index in range(0, len(audio), chunk_size):
+            chunk = audio[index : index + chunk_size]
+            payload = base64.b64encode(chunk).decode("ascii")
+            if sent_count == 0:
+                self._set_assistant_speaking(True, "cartesia_first_audio_delta")
+                self._transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_first_audio_delta")
+                self.response_first_audio_at = monotonic()
+                if self.first_audio_delta_at is None:
+                    self.first_audio_delta_at = self.response_first_audio_at
+                log.info(
+                    "assistant_audio_first_delta",
+                    response_id=response_id,
+                    source="cartesia",
+                    bytes=len(chunk),
+                    response_create_to_first_audio_ms=self._elapsed_ms(self.response_create_sent_at, self.response_first_audio_at),
+                    call_to_first_audio_ms=self._elapsed_ms(self.call_started_at, self.response_first_audio_at),
+                )
+            if self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": payload}}, "audio"):
+                sent_count += 1
+        if sent_count == 0:
+            return
+        self.twilio_media_sent_count += sent_count
+        self.response_audio_sent_counts[response_id] = self.response_audio_sent_counts.get(response_id, 0) + sent_count
+        self.last_assistant_audio_at = monotonic()
+        for _ in range(sent_count):
+            self.metrics.inc("voice_twilio_media_sent_total")
+        log.info(
+            "cartesia_audio_enqueued",
+            response_id=response_id,
+            chunks=sent_count,
+            audio_bytes=len(audio),
+            chunk_size=chunk_size,
+        )
+        await self._send_twilio_mark(response_id)
 
     async def _send_twilio_mark(self, response_id: str) -> None:
         if not self.state or not self.state.stream_sid:
