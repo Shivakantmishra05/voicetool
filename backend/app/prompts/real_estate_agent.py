@@ -215,8 +215,7 @@ OUTGOING_CONFIRM_LINE = "Namaste sir, kya meri baat {customer_name} ji se ho rah
 
 OUTGOING_INTRO_LINE = (
     "Main Riya bol rahi hoon DreamHome Properties se. "
-    "Aapki property enquiry receive hui thi. "
-    "Kya abhi do minute baat kar sakte hain?"
+    "Aapki property enquiry receive hui thi. Abhi baat kar sakte hain?"
 )
 
 INCOMING_GREETING = "Haan ji, DreamHome Properties. Bataiye?"

@@ -1044,6 +1044,22 @@ class TwilioMediaSession:
                 force=True,
             )
             return
+        if not self.customer_memory.get("intro_delivered"):
+            self.customer_memory = await self.call_memory.update_memory(
+                self.state.call_sid,
+                {
+                    "intro_delivered": True,
+                    "conversation_stage": "INTRO",
+                },
+            )
+            await self._request_assistant_response(
+                "Say exactly this one line in a warm, natural Indian phone-call tone, then stop. "
+                "Do not ask about area, BHK, or budget yet:\n"
+                f"{OUTGOING_INTRO_LINE}",
+                reason="outgoing_intro",
+                force=True,
+            )
+            return
         await self._request_assistant_response(
             self._build_response_instructions(),
             reason="user_transcript",
@@ -1089,17 +1105,6 @@ class TwilioMediaSession:
                 "\n\n".join(contexts)
                 + f"\n\nCaller is busy. Confirm callback at {callback_time}.\n"
                 "Say: 'Theek hai sir, [time] pe call karti hoon. Namaste ji.' Then close."
-            )
-
-        # ── First real turn: caller just confirmed their identity after the
-        #    greeting. Deliver the Step 2 intro line verbatim, then stop.
-        #    After this turn, intro_delivered is set and normal flow resumes.
-        if not self.customer_memory.get("intro_delivered"):
-            self.customer_memory["intro_delivered"] = True  # optimistic local flag
-            return (
-                "\n\n".join(contexts)
-                + "\n\nSay exactly this in a warm, natural Indian phone-call tone, then stop:\n"
-                + OUTGOING_INTRO_LINE
             )
 
         do_not_ask = ", ".join(
