@@ -211,11 +211,11 @@ Isliye log tujh pe trust karte hain.
 
 # ── Greetings ──────────────────────────────────────────────
 
-OUTGOING_CONFIRM_LINE = "Namaste sir, kya meri baat {customer_name} ji se ho rahi hai?"
+OUTGOING_CONFIRM_LINE = "Namaste sir... kya main {customer_name} ji se baat kar rahi hoon?"
 
 OUTGOING_INTRO_LINE = (
-    "Main Riya bol rahi hoon DreamHome Properties se. "
-    "Aapki property enquiry receive hui thi. Abhi baat kar sakte hain?"
+    "Main Riya, DreamHome Properties se. "
+    "Aapki property enquiry aayi thi... abhi ek minute baat ho paayegi?"
 )
 
 INCOMING_GREETING = "Haan ji, DreamHome Properties. Bataiye?"

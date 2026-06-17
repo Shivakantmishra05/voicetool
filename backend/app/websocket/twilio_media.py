@@ -389,6 +389,13 @@ class TwilioMediaSession:
         if request_greeting:
             self.greeting_clear_locked_until = monotonic() + GREETING_LOCK_SECONDS
             log.info("greeting_started", lock_seconds=GREETING_LOCK_SECONDS)
+            if self._using_cartesia_tts():
+                await self._speak_fixed_text(
+                    self._greeting_text(),
+                    response_id="cartesia-greeting",
+                    reason="greeting",
+                )
+                return
             await self._request_assistant_response(
                 self._build_greeting_instructions(),
                 reason="greeting",
@@ -715,6 +722,37 @@ class TwilioMediaSession:
     def _using_cartesia_tts(self) -> bool:
         return getattr(self, "cartesia_tts", None) is not None
 
+    async def _speak_fixed_text(self, text: str, *, response_id: str, reason: str) -> None:
+        cleaned = " ".join(str(text or "").split())
+        if not cleaned or not self.cartesia_tts or not self.state or self.stopping:
+            return
+        if reason == "greeting":
+            self.greeting_response_id = response_id
+        self._add_transcript_turn("assistant", cleaned)
+        started = monotonic()
+        log.info("cartesia_fixed_tts_started", reason=reason, response_id=response_id, chars=len(cleaned))
+        try:
+            ulaw_audio = await self.cartesia_tts.synthesize_ulaw(cleaned, call_sid=self.state.call_sid)
+        except Exception as exc:
+            log.exception("cartesia_fixed_tts_failed", reason=reason, response_id=response_id, error=str(exc))
+            self.metrics.inc("cartesia_tts_failure_total")
+            if reason == "greeting":
+                await self._request_assistant_response(
+                    self._build_greeting_instructions(),
+                    reason="greeting_fallback",
+                    force=True,
+                )
+            return
+        self.metrics.inc("cartesia_tts_success_total")
+        log.info(
+            "cartesia_fixed_tts_ready",
+            reason=reason,
+            response_id=response_id,
+            latency_ms=self._elapsed_ms(started, monotonic()),
+            audio_bytes=len(ulaw_audio),
+        )
+        await self._send_twilio_ulaw_audio(ulaw_audio, response_id=response_id)
+
     async def _speak_with_cartesia(self, transcript: str | None, response_id: str | None) -> None:
         text = " ".join(str(transcript or "").split())
         if not text or not self.cartesia_tts or not self.state or self.stopping:
@@ -1037,6 +1075,13 @@ class TwilioMediaSession:
             self.customer_memory = await self.call_memory.load_memory(self.state.call_sid)
         forced_response = self._forced_safety_response(text)
         if forced_response:
+            if self._using_cartesia_tts():
+                await self._speak_fixed_text(
+                    forced_response,
+                    response_id="cartesia-forced-safety",
+                    reason="forced_safety_response",
+                )
+                return
             await self._request_assistant_response(
                 "Say exactly this one line, then stop. Do not add anything else:\n"
                 f"{forced_response}",
@@ -1052,6 +1097,13 @@ class TwilioMediaSession:
                     "conversation_stage": "INTRO",
                 },
             )
+            if self._using_cartesia_tts():
+                await self._speak_fixed_text(
+                    OUTGOING_INTRO_LINE,
+                    response_id="cartesia-outgoing-intro",
+                    reason="outgoing_intro",
+                )
+                return
             await self._request_assistant_response(
                 "Say exactly this one line in a warm, natural Indian phone-call tone, then stop. "
                 "Do not ask about area, BHK, or budget yet:\n"
@@ -1139,15 +1191,16 @@ class TwilioMediaSession:
             return AI_IDENTITY_RESPONSE_HINDI
         return None
 
-    def _build_greeting_instructions(self) -> str:
-        # Inject the customer name from memory, fall back to "aap" so the
-        # sentence stays grammatical even if the name hasn't been loaded yet.
+    def _greeting_text(self) -> str:
         customer_name = (
             str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
             or getattr(self.claims, "customer_name", None)
             or "Shivakant Mishra"
         )
-        confirm_line = OUTGOING_CONFIRM_LINE.format(customer_name=customer_name)
+        return OUTGOING_CONFIRM_LINE.format(customer_name=customer_name)
+
+    def _build_greeting_instructions(self) -> str:
+        confirm_line = self._greeting_text()
         instructions = (
             "Say exactly this one line in a warm, natural Indian phone-call tone, then stop "
             "and wait for the caller to respond. Do not add anything else:\n"
@@ -1155,7 +1208,7 @@ class TwilioMediaSession:
         )
         log.info(
             "greeting_instructions_preview",
-            customer_name=customer_name,
+            greeting_text=confirm_line,
             chars=len(instructions),
             preview=_preview(instructions),
         )
