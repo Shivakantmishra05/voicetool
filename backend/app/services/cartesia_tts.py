@@ -10,12 +10,23 @@ from app.utils.logging import log
 class CartesiaTTS:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._client: httpx.AsyncClient | None = None
+        self._cache: dict[str, bytes] = {}
+
+    async def close(self) -> None:
+        if self._client:
+            await self._client.aclose()
+            self._client = None
 
     async def synthesize_ulaw(self, text: str, *, call_sid: str | None = None) -> bytes:
         if not self.settings.cartesia_api_key:
             raise RuntimeError("CARTESIA_API_KEY is not configured")
         if not self.settings.cartesia_voice_id:
             raise RuntimeError("CARTESIA_VOICE_ID is not configured")
+        cache_key = " ".join(text.split())
+        if cache_key in self._cache:
+            log.info("cartesia_tts_cache_hit", call_sid=call_sid, chars=len(text))
+            return self._cache[cache_key]
 
         payload = {
             "model_id": self.settings.cartesia_model_id,
@@ -51,12 +62,13 @@ class CartesiaTTS:
             output_encoding="pcm_s16le",
             output_sample_rate=self.settings.cartesia_sample_rate,
         )
-        async with httpx.AsyncClient(timeout=self.settings.tts_timeout_seconds) as client:
-            response = await client.post(
-                "https://api.cartesia.ai/tts/bytes",
-                headers=headers,
-                json=payload,
-            )
+        if not self._client:
+            self._client = httpx.AsyncClient(timeout=self.settings.tts_timeout_seconds)
+        response = await self._client.post(
+            "https://api.cartesia.ai/tts/bytes",
+            headers=headers,
+            json=payload,
+        )
         if response.status_code >= 400:
             log.error(
                 "cartesia_tts_failed",
@@ -67,6 +79,9 @@ class CartesiaTTS:
             response.raise_for_status()
 
         ulaw = wav_pcm_to_ulaw_8khz(response.content)
+        if len(self._cache) >= 32:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[cache_key] = ulaw
         log.info(
             "cartesia_tts_success",
             call_sid=call_sid,

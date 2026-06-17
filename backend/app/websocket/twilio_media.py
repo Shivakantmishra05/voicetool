@@ -707,10 +707,14 @@ class TwilioMediaSession:
         if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
             log.info("cartesia_tts_skipped", response_id=response_id, reason="caller_speaking")
             return
+        self._set_assistant_speaking(True, "cartesia_tts_started")
+        with contextlib.suppress(ValueError):
+            self._transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_tts_started")
         started = monotonic()
         try:
             ulaw_audio = await self.cartesia_tts.synthesize_ulaw(text, call_sid=self.state.call_sid)
         except Exception as exc:
+            self._set_assistant_speaking(False, "cartesia_tts_failed")
             log.exception("cartesia_tts_playback_failed", response_id=response_id, error=str(exc))
             self.metrics.inc("cartesia_tts_failure_total")
             return
@@ -1319,6 +1323,9 @@ class TwilioMediaSession:
         self.stopping = True
         self._transition(CallPhase.FAILED if failure_reason else CallPhase.CALL_ENDING, failure_reason or "normal_stop")
         await self._close_openai()
+        if self.cartesia_tts:
+            with contextlib.suppress(Exception):
+                await self.cartesia_tts.close()
         if self.state:
             summary = await self._summarize_and_persist_call()
             async with SessionLocal() as session:
