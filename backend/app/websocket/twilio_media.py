@@ -157,6 +157,8 @@ class TwilioMediaSession:
         self.stopping = False
         self.transcript_turns: list[dict[str, str]] = []
         self.assistant_transcript_parts: dict[str, list[str]] = {}
+        self.openai_audio_fallback_parts: dict[str, list[str]] = {}
+        self.cartesia_playback_started: set[str] = set()
         self.greeting_clear_locked_until = 0.0
         self.greeting_response_id: str | None = None
         self.greeting_completed = False
@@ -506,12 +508,18 @@ class TwilioMediaSession:
         if event_type in {"response.audio.delta", "response.output_audio.delta"}:
             self.openai_audio_delta_count += 1
             if self._using_cartesia_tts():
+                response_id = event.get("response_id") or self.current_response_id or "active"
+                delta = event.get("delta")
+                if delta:
+                    parts = self.openai_audio_fallback_parts.setdefault(response_id, [])
+                    if len(parts) < 500:
+                        parts.append(str(delta))
                 if self.response_first_audio_at is None:
                     self.response_first_audio_at = monotonic()
                 if self.openai_audio_delta_count == 1:
                     log.info(
                         "openai_audio_delta_ignored_for_cartesia",
-                        response_id=event.get("response_id"),
+                        response_id=response_id,
                         output_format=self.openai_output_audio_format,
                     )
                 return
@@ -548,7 +556,11 @@ class TwilioMediaSession:
         if event_type in {"response.audio.done", "response.output_audio.done"}:
             response_id = event.get("response_id") or self.current_response_id or "openai-response"
             if self._using_cartesia_tts():
-                log.info("openai_audio_done_ignored_for_cartesia", response_id=response_id)
+                log.info(
+                    "openai_audio_done_ignored_for_cartesia",
+                    response_id=response_id,
+                    fallback_chunks=len(self.openai_audio_fallback_parts.get(response_id, [])),
+                )
                 return
             response_media_sent = self.response_audio_sent_counts.pop(response_id, 0)
             log.info(
@@ -563,13 +575,16 @@ class TwilioMediaSession:
                 log.info("assistant_audio_done_no_twilio_audio", response_id=response_id)
             return
         if event_type == "response.done":
+            response_id = event.get("response_id") or (event.get("response") or {}).get("id")
             log.info(
                 "response_done",
-                response_id=event.get("response_id") or (event.get("response") or {}).get("id"),
+                response_id=response_id,
                 status=(event.get("response") or {}).get("status"),
                 audio_delta_count=self.openai_audio_delta_count,
             )
             self._handle_response_completed(event)
+            if self._using_cartesia_tts() and response_id:
+                self._spawn(self._delayed_cartesia_fallback(response_id), "cartesia_delayed_fallback")
             return
         if event_type == "error":
             log.warning("openai_realtime_error", error=event.get("error"), active_voice=self.active_realtime_voice)
@@ -707,6 +722,8 @@ class TwilioMediaSession:
         if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
             log.info("cartesia_tts_skipped", response_id=response_id, reason="caller_speaking")
             return
+        if response_id:
+            self.cartesia_playback_started.add(response_id)
         self._set_assistant_speaking(True, "cartesia_tts_started")
         with contextlib.suppress(ValueError):
             self._transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_tts_started")
@@ -717,6 +734,7 @@ class TwilioMediaSession:
             self._set_assistant_speaking(False, "cartesia_tts_failed")
             log.exception("cartesia_tts_playback_failed", response_id=response_id, error=str(exc))
             self.metrics.inc("cartesia_tts_failure_total")
+            await self._play_openai_audio_fallback(response_id)
             return
         self.metrics.inc("cartesia_tts_success_total")
         log.info(
@@ -726,6 +744,8 @@ class TwilioMediaSession:
             audio_bytes=len(ulaw_audio),
         )
         await self._send_twilio_ulaw_audio(ulaw_audio, response_id=response_id or self.current_response_id or "cartesia-response")
+        if response_id:
+            self.openai_audio_fallback_parts.pop(response_id, None)
 
     async def _send_twilio_ulaw_audio(self, audio: bytes, *, response_id: str) -> None:
         if not audio or not self.state or not self.state.stream_sid:
@@ -769,6 +789,24 @@ class TwilioMediaSession:
             chunk_size=chunk_size,
         )
         await self._send_twilio_mark(response_id)
+
+    async def _play_openai_audio_fallback(self, response_id: str | None) -> None:
+        fallback_id = response_id or self.current_response_id or "active"
+        parts = self.openai_audio_fallback_parts.pop(fallback_id, [])
+        if not parts:
+            log.error("openai_audio_fallback_missing", response_id=fallback_id)
+            return
+        log.warning("openai_audio_fallback_playing", response_id=fallback_id, chunks=len(parts))
+        for payload in parts:
+            await self._send_twilio_audio(payload, response_id=fallback_id)
+        await self._send_twilio_mark(fallback_id)
+
+    async def _delayed_cartesia_fallback(self, response_id: str) -> None:
+        await asyncio.sleep(0.4)
+        if response_id in self.cartesia_playback_started or response_id not in self.openai_audio_fallback_parts:
+            return
+        log.warning("cartesia_transcript_missing_using_openai_fallback", response_id=response_id)
+        await self._play_openai_audio_fallback(response_id)
 
     async def _send_twilio_mark(self, response_id: str) -> None:
         if not self.state or not self.state.stream_sid:
