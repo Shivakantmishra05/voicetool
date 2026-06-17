@@ -27,7 +27,6 @@ from app.conversation.stage_manager import determine_stage_with_reason, get_stag
 from app.database.session import SessionLocal
 from app.models import Call
 from app.prompts.real_estate_agent import (
-    FIRST_DISCOVERY_LINE,
     SYSTEM_PROMPT,
     OUTGOING_CONFIRM_LINE,
     OUTGOING_INTRO_LINE,
@@ -390,13 +389,6 @@ class TwilioMediaSession:
         if request_greeting:
             self.greeting_clear_locked_until = monotonic() + GREETING_LOCK_SECONDS
             log.info("greeting_started", lock_seconds=GREETING_LOCK_SECONDS)
-            if self._using_cartesia_tts():
-                await self._speak_fixed_text(
-                    self._greeting_text(),
-                    response_id="cartesia-greeting",
-                    reason="greeting",
-                )
-                return
             await self._request_assistant_response(
                 self._build_greeting_instructions(),
                 reason="greeting",
@@ -1094,14 +1086,6 @@ class TwilioMediaSession:
             )
             return
         if not self.customer_memory.get("intro_delivered"):
-            if not self._is_identity_confirmation(text):
-                await self._request_assistant_response(
-                    self._build_response_instructions()
-                    + "\n\nCaller has not clearly confirmed identity yet. Do not ask property questions. "
-                    "Politely clarify if this is the right person.",
-                    reason="identity_confirmation_unclear",
-                )
-                return
             self.customer_memory = await self.call_memory.update_memory(
                 self.state.call_sid,
                 {
@@ -1109,46 +1093,11 @@ class TwilioMediaSession:
                     "conversation_stage": "INTRO",
                 },
             )
-            if self._using_cartesia_tts():
-                await self._speak_fixed_text(
-                    OUTGOING_INTRO_LINE,
-                    response_id="cartesia-outgoing-intro",
-                    reason="outgoing_intro",
-                )
-                return
             await self._request_assistant_response(
-                "Say exactly this one line in a warm, natural Indian phone-call tone, then stop. "
-                "Do not ask about area, BHK, or budget yet:\n"
-                f"{OUTGOING_INTRO_LINE}",
+                self._build_response_instructions()
+                + "\n\nCaller has replied to the opening. Follow the prompt's Step 2 intro naturally. "
+                "Do not start property discovery in this turn.",
                 reason="outgoing_intro",
-                force=True,
-            )
-            return
-        if (
-            self.customer_memory.get("intro_delivered")
-            and not self.customer_memory.get("first_discovery_delivered")
-            and self._is_identity_confirmation(text)
-            and not self._has_requirement_update(updates)
-        ):
-            self.customer_memory = await self.call_memory.update_memory(
-                self.state.call_sid,
-                {
-                    "first_discovery_delivered": True,
-                    "conversation_stage": "DISCOVERY",
-                },
-            )
-            if self._using_cartesia_tts():
-                await self._speak_fixed_text(
-                    FIRST_DISCOVERY_LINE,
-                    response_id="cartesia-first-discovery",
-                    reason="first_discovery",
-                )
-                return
-            await self._request_assistant_response(
-                "Say exactly this one line in a warm, natural Indian phone-call tone, then stop:\n"
-                f"{FIRST_DISCOVERY_LINE}",
-                reason="first_discovery",
-                force=True,
             )
             return
         await self._request_assistant_response(
@@ -1234,49 +1183,6 @@ class TwilioMediaSession:
     def _is_twilio_trial_notice(text: str) -> bool:
         lowered = str(text or "").lower()
         return "trial account" in lowered or "remove this message" in lowered
-
-    @staticmethod
-    def _is_identity_confirmation(text: str) -> bool:
-        lowered = str(text or "").lower()
-        confirmations = (
-            "haan",
-            "han",
-            "yes",
-            "yeah",
-            "ji",
-            "ho rahi",
-            "bol raha",
-            "bol rahi",
-            "speaking",
-            "this is",
-            "main ",
-            "मै",
-            "हाँ",
-            "हां",
-            "जी",
-            "हो रही",
-        )
-        wrong_number = ("wrong number", "galat number", "गलत", "nahi", "nahin", "नहीं", "नही")
-        return any(token in lowered for token in confirmations) and not any(token in lowered for token in wrong_number)
-
-    @staticmethod
-    def _has_requirement_update(updates: dict[str, Any]) -> bool:
-        return any(
-            updates.get(field)
-            for field in (
-                "budget",
-                "bhk",
-                "property_type",
-                "location_interest",
-                "preferred_location",
-                "project_preference",
-                "purpose",
-                "self_use_or_investment",
-                "timeline",
-                "buying_timeline",
-                "visit_interest",
-            )
-        )
 
     def _greeting_text(self) -> str:
         customer_name = (
