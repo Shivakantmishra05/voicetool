@@ -40,6 +40,7 @@ DEFAULT_MEMORY: dict[str, Any] = {
     "conversation_stage": "INTRO",
     "not_interested_count": 0,
     "intro_delivered": False,
+    "first_discovery_delivered": False,
     "objections": [],
     "lead_score": 0,
     "decision_maker": None,

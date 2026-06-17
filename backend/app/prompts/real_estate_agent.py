@@ -218,6 +218,8 @@ OUTGOING_INTRO_LINE = (
     "Aapki property enquiry aayi thi... abhi ek minute baat ho paayegi?"
 )
 
+FIRST_DISCOVERY_LINE = "Achha... aap Noida side dekh rahe hain ya Greater Noida West?"
+
 INCOMING_GREETING = "Haan ji, DreamHome Properties. Bataiye?"
 
 GREETING = OUTGOING_CONFIRM_LINE
