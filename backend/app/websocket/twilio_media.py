@@ -22,6 +22,7 @@ from app.conversation.memory_manager import CallMemoryManager, build_memory_cont
 from app.conversation.objection_detector import detect_objections, get_objection_context, merge_objections
 import app.conversation.persona as persona_module
 from app.conversation.persona import get_persona_context
+from app.conversation.project_matcher import project_context
 from app.conversation.quality_metrics import assistant_turn_metrics, user_turn_metrics
 from app.conversation.stage_manager import determine_stage_with_reason, get_stage_context
 from app.database.session import SessionLocal
@@ -57,6 +58,11 @@ TWILIO_OUTBOUND_QUEUE_SIZE = 1000
 OPENAI_HEARTBEAT_SECONDS = 20.0
 OPENAI_PONG_TIMEOUT_SECONDS = 10.0
 OPENAI_RECONNECT_ATTEMPTS = 3
+CRITICAL_BACKGROUND_TASKS = {
+    "twilio_outbound_sender",
+    "openai_realtime_connector",
+    "openai_realtime_receiver",
+}
 UNSUPPORTED_AREA_RESPONSE = (
     "Woh area hamare paas covered nahi hai abhi. Hamare projects Greater Noida West mein hain — "
     "agar kabhi us side consider karo toh batana."
@@ -158,6 +164,7 @@ class TwilioMediaSession:
         self.transcript_turns: list[dict[str, str]] = []
         self.assistant_transcript_parts: dict[str, list[str]] = {}
         self.openai_audio_fallback_parts: dict[str, list[str]] = {}
+        self.cartesia_tts_active: set[str] = set()
         self.cartesia_playback_started: set[str] = set()
         self.greeting_clear_locked_until = 0.0
         self.greeting_response_id: str | None = None
@@ -484,9 +491,12 @@ class TwilioMediaSession:
             if self._greeting_locked():
                 log.info("interruption_ignored_during_greeting")
                 return
+            if self.phase in {CallPhase.OPENAI_CONNECTING, CallPhase.OPENAI_CONNECTED, CallPhase.SESSION_UPDATING}:
+                log.info("speech_started_ignored_before_session_ready", phase=self.phase.value)
+                return
             self.caller_speaking = True
             self.caller_speech_started_at = monotonic()
-            self._transition(CallPhase.USER_SPEAKING, "openai_speech_started")
+            self._safe_transition(CallPhase.USER_SPEAKING, "openai_speech_started")
             log.info("openai_speech_started")
             if self._barge_in_task and not self._barge_in_task.done():
                 return
@@ -495,6 +505,7 @@ class TwilioMediaSession:
         if event_type == "input_audio_buffer.speech_stopped":
             self.last_activity_at = monotonic()
             self.caller_speaking = False
+            self.caller_speech_started_at = None
             log.info("openai_speech_stopped")
             if not self.assistant_response_active and not self.assistant_speaking and not self.pending_marks:
                 await self._flush_deferred_response()
@@ -592,9 +603,9 @@ class TwilioMediaSession:
             return
         log.debug("openai_realtime_event_ignored", openai_event=event_type)
 
-    async def _send_twilio_audio(self, payload: str | None, *, response_id: str | None = None) -> None:
+    async def _send_twilio_audio(self, payload: str | None, *, response_id: str | None = None) -> int:
         if not payload or not self.state or not self.state.stream_sid:
-            return
+            return 0
         if (
             response_id == getattr(self, "greeting_response_id", None)
             and not getattr(self, "greeting_completed", False)
@@ -607,14 +618,14 @@ class TwilioMediaSession:
                 dropped_count=self.greeting_warmup_chunks_dropped,
                 drop_limit=self.greeting_warmup_chunks_to_drop,
             )
-            return
+            return 0
         if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
             self.metrics.inc("voice_stale_audio_skipped_total")
             log.info("stale_audio_skipped", response_id=response_id, reason="caller_speaking")
-            return
+            return 0
         payloads = self._twilio_safe_audio_payloads(payload, response_id=response_id)
         if not payloads:
-            return
+            return 0
         sent_count = 0
         for safe_payload in payloads:
             if self.twilio_media_sent_count == 0 and sent_count == 0:
@@ -633,10 +644,10 @@ class TwilioMediaSession:
             if self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": safe_payload}}, "audio"):
                 sent_count += 1
         if sent_count == 0:
-            return
+            return 0
         if not self.assistant_speaking:
             self._set_assistant_speaking(True, "first_audio_delta")
-            self._transition(CallPhase.ASSISTANT_SPEAKING, "first_audio_delta")
+            self._safe_transition(CallPhase.ASSISTANT_SPEAKING, "first_audio_delta")
             self.response_first_audio_at = monotonic()
             if self.first_audio_delta_at is None:
                 self.first_audio_delta_at = self.response_first_audio_at
@@ -659,6 +670,7 @@ class TwilioMediaSession:
         self.last_assistant_audio_at = monotonic()
         for _ in range(sent_count):
             self.metrics.inc("voice_twilio_media_sent_total")
+        return sent_count
 
     def _record_openai_audio_format(self, event: dict) -> None:
         output = (((event.get("session") or {}).get("audio") or {}).get("output") or {})
@@ -753,15 +765,15 @@ class TwilioMediaSession:
         if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
             log.info("cartesia_tts_skipped", response_id=response_id, reason="caller_speaking")
             return
-        if response_id:
-            self.cartesia_playback_started.add(response_id)
+        playback_id = response_id or self.current_response_id or "cartesia-response"
+        self.cartesia_tts_active.add(playback_id)
         self._set_assistant_speaking(True, "cartesia_tts_started")
-        with contextlib.suppress(ValueError):
-            self._transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_tts_started")
+        self._safe_transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_tts_started")
         started = monotonic()
         try:
             ulaw_audio = await self.cartesia_tts.synthesize_ulaw(text, call_sid=self.state.call_sid)
         except Exception as exc:
+            self.cartesia_tts_active.discard(playback_id)
             self._set_assistant_speaking(False, "cartesia_tts_failed")
             log.exception("cartesia_tts_playback_failed", response_id=response_id, error=str(exc))
             self.metrics.inc("cartesia_tts_failure_total")
@@ -774,16 +786,30 @@ class TwilioMediaSession:
             latency_ms=self._elapsed_ms(started, monotonic()),
             audio_bytes=len(ulaw_audio),
         )
-        await self._send_twilio_ulaw_audio(ulaw_audio, response_id=response_id or self.current_response_id or "cartesia-response")
-        if response_id:
-            self.openai_audio_fallback_parts.pop(response_id, None)
-
-    async def _send_twilio_ulaw_audio(self, audio: bytes, *, response_id: str) -> None:
-        if not audio or not self.state or not self.state.stream_sid:
+        try:
+            sent_count = await self._send_twilio_ulaw_audio(ulaw_audio, response_id=playback_id)
+        except Exception as exc:
+            self._set_assistant_speaking(False, "cartesia_audio_send_failed")
+            log.exception("cartesia_audio_send_failed", response_id=playback_id, error=str(exc))
+            self.metrics.inc("cartesia_tts_failure_total")
+            await self._play_openai_audio_fallback(playback_id)
             return
+        finally:
+            self.cartesia_tts_active.discard(playback_id)
+        if sent_count:
+            self.cartesia_playback_started.add(playback_id)
+            self.openai_audio_fallback_parts.pop(playback_id, None)
+        else:
+            log.warning("cartesia_audio_not_sent", response_id=playback_id, caller_speaking=self.caller_speaking, phase=self.phase.value)
+            if not self.pending_marks:
+                self._set_assistant_speaking(False, "cartesia_audio_not_sent")
+
+    async def _send_twilio_ulaw_audio(self, audio: bytes, *, response_id: str) -> int:
+        if not audio or not self.state or not self.state.stream_sid:
+            return 0
         if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
             log.info("cartesia_audio_skipped", response_id=response_id, reason="caller_speaking")
-            return
+            return 0
         sent_count = 0
         chunk_size = 160
         for index in range(0, len(audio), chunk_size):
@@ -791,7 +817,7 @@ class TwilioMediaSession:
             payload = base64.b64encode(chunk).decode("ascii")
             if sent_count == 0:
                 self._set_assistant_speaking(True, "cartesia_first_audio_delta")
-                self._transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_first_audio_delta")
+                self._safe_transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_first_audio_delta")
                 self.response_first_audio_at = monotonic()
                 if self.first_audio_delta_at is None:
                     self.first_audio_delta_at = self.response_first_audio_at
@@ -806,7 +832,7 @@ class TwilioMediaSession:
             if self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": payload}}, "audio"):
                 sent_count += 1
         if sent_count == 0:
-            return
+            return 0
         self.twilio_media_sent_count += sent_count
         self.response_audio_sent_counts[response_id] = self.response_audio_sent_counts.get(response_id, 0) + sent_count
         self.last_assistant_audio_at = monotonic()
@@ -820,21 +846,34 @@ class TwilioMediaSession:
             chunk_size=chunk_size,
         )
         await self._send_twilio_mark(response_id)
+        return sent_count
 
     async def _play_openai_audio_fallback(self, response_id: str | None) -> None:
         fallback_id = response_id or self.current_response_id or "active"
         parts = self.openai_audio_fallback_parts.pop(fallback_id, [])
         if not parts:
             log.error("openai_audio_fallback_missing", response_id=fallback_id)
+            if not self.pending_marks:
+                self._set_assistant_speaking(False, "openai_audio_fallback_missing")
             return
         log.warning("openai_audio_fallback_playing", response_id=fallback_id, chunks=len(parts))
+        sent_count = 0
         for payload in parts:
-            await self._send_twilio_audio(payload, response_id=fallback_id)
-        await self._send_twilio_mark(fallback_id)
+            sent_count += await self._send_twilio_audio(payload, response_id=fallback_id)
+        if sent_count:
+            await self._send_twilio_mark(fallback_id)
+            return
+        log.error("openai_audio_fallback_not_sent", response_id=fallback_id, chunks=len(parts))
+        if not self.pending_marks:
+            self._set_assistant_speaking(False, "openai_audio_fallback_not_sent")
 
     async def _delayed_cartesia_fallback(self, response_id: str) -> None:
         await asyncio.sleep(0.4)
-        if response_id in self.cartesia_playback_started or response_id not in self.openai_audio_fallback_parts:
+        if (
+            response_id in self.cartesia_playback_started
+            or response_id in self.cartesia_tts_active
+            or response_id not in self.openai_audio_fallback_parts
+        ):
             return
         log.warning("cartesia_transcript_missing_using_openai_fallback", response_id=response_id)
         await self._play_openai_audio_fallback(response_id)
@@ -1128,23 +1167,16 @@ class TwilioMediaSession:
         stage = self.customer_memory.get("conversation_stage", "INTRO")
         language = self.customer_memory.get("language", "hinglish")
 
-        contexts = [
-            get_persona_context(language),
-            get_language_context(self.customer_memory),
-            build_memory_context(self.customer_memory),
-        ]
-
-        if self.customer_memory.get("objections"):
-            contexts.append(get_objection_context(self.customer_memory))
-        elif stage in ("SITE_VISIT_BOOKING", "CLOSING"):
-            contexts.append(get_stage_context(self.customer_memory))
-
         if self.customer_memory.get("callback_requested"):
             callback_time = self.customer_memory.get("callback_time") or "unspecified time"
             return (
-                "\n\n".join(contexts)
+                build_dynamic_response_context(
+                    get_persona_context(language),
+                    build_memory_context(self.customer_memory),
+                    language_context=get_language_context(self.customer_memory),
+                )
                 + f"\n\nCaller is busy. Confirm callback at {callback_time}.\n"
-                "Say: 'Theek hai sir, [time] pe call karti hoon. Namaste ji.' Then close."
+                "Reply in one short line, then close."
             )
 
         do_not_ask = ", ".join(
@@ -1154,16 +1186,16 @@ class TwilioMediaSession:
         )
 
         return (
-            "\n\n".join(contexts)
+            build_dynamic_response_context(
+                get_persona_context(language),
+                build_memory_context(self.customer_memory),
+                stage_context=get_stage_context(self.customer_memory) if stage in ("SITE_VISIT_BOOKING", "CLOSING") else "",
+                objection_context=get_objection_context(self.customer_memory) if self.customer_memory.get("objections") else "",
+                language_context=get_language_context(self.customer_memory),
+                matched_project_context=project_context(self.customer_memory),
+            )
             + f"\n\nDo not ask: {do_not_ask or 'none'}.\n"
-            "Jo pata hai — mat poochho dobara. Yeh sabse important hai.\n"
-            "Jo memory mein nahi hai, usko pehle bataya hua mat bolo.\n"
-            "React pehle, phir respond. Short. Silence se mat ghabrao.\n"
-            "Objection aayi — pehle acknowledge karo, turant counter mat karo.\n"
-            "Hot lead hai (budget+BHK+visit known) — visit book karo, aur kuch mat poochho.\n"
-            "Ek turn mein ek hi sawaal. Budget, BHK, location ek saath mat poochho.\n"
-            "Unknown area/project par kuch invent mat karo.\n"
-            "Off-topic ho to current language mein softly redirect karo."
+            "Reply now. One sentence only."
         )
 
     def _forced_safety_response(self, text: str) -> str | None:
@@ -1251,7 +1283,7 @@ class TwilioMediaSession:
                         reason="caller_speaking",
                     )
                 elif not self.assistant_response_active:
-                    self._transition(CallPhase.WAITING_FOR_USER, "twilio_mark_ack")
+                    self._safe_transition(CallPhase.WAITING_FOR_USER, "twilio_mark_ack")
             if response_id == self.greeting_response_id and not self.greeting_completed:
                 self.greeting_completed = True
                 log.info("greeting_finished", response_id=response_id)
@@ -1283,6 +1315,8 @@ class TwilioMediaSession:
         log.info("barge_in_confirmed", speech_ms=round(speech_seconds * 1000, 2), response_id=self.current_response_id)
         await self._clear_twilio_buffer()
         await self._cancel_current_openai_response("barge_in")
+        self.openai_audio_fallback_parts.clear()
+        self.cartesia_tts_active.clear()
 
     async def _cancel_current_openai_response(self, reason: str) -> None:
         if not self.assistant_response_active and not self.assistant_speaking and self.current_response_id is None:
@@ -1515,7 +1549,7 @@ class TwilioMediaSession:
             return
         log.exception("background_task_failed", task_name=task.get_name(), error=str(exc))
         self.metrics.inc("voice_background_task_failed_total")
-        if not self.stopping:
+        if not self.stopping and task.get_name() in CRITICAL_BACKGROUND_TASKS:
             asyncio.create_task(self._stop(failure_reason=f"background task failed: {task.get_name()}"))
 
     def _transition(self, phase: CallPhase, reason: str) -> None:
@@ -1529,6 +1563,20 @@ class TwilioMediaSession:
         self.phase = phase
         self.metrics.inc("voice_state_transition_total")
         log.info("call_state_transition", previous=previous.value, new=phase.value, reason=reason)
+
+    def _safe_transition(self, phase: CallPhase, reason: str) -> bool:
+        try:
+            self._transition(phase, reason)
+            return True
+        except RuntimeError as exc:
+            log.warning(
+                "call_state_transition_skipped",
+                current=self.phase.value,
+                attempted=phase.value,
+                reason=reason,
+                error=str(exc),
+            )
+            return False
 
     async def _cancel_tasks(self) -> None:
         tasks = [task for task in self.tasks if not task.done()]
@@ -1550,7 +1598,6 @@ def _realtime_instructions(language: str = "hinglish") -> str:
         "- Silence se mat ghabrao. Pressure mat daalo.\n"
         "- Current language mein raho unless caller explicitly switches.\n"
         "- Off-topic sawaal par same language mein short redirect.\n"
-        "- 1 BHK available: Orchid Rs 25L, Green Valley Rs 28L.\n"
         "- If caller busy, ask callback time and close warmly.\n"
     )
 

@@ -75,10 +75,12 @@ async def _check_twilio(settings: Settings) -> ProviderCheck:
 
 
 async def _check_openai(settings: Settings) -> ProviderCheck:
+    model = settings.openai_text_model if settings.voice_pipeline == "text_streaming" else settings.openai_realtime_model
+
     async def run():
         async with httpx.AsyncClient(timeout=settings.provider_check_timeout_seconds) as client:
             response = await client.get(
-                f"https://api.openai.com/v1/models/{settings.openai_realtime_model}",
+                f"https://api.openai.com/v1/models/{model}",
                 headers={"Authorization": f"Bearer {settings.openai_api_key}"},
             )
             response.raise_for_status()

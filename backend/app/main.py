@@ -22,6 +22,7 @@ from app.telephony.stream_auth import StreamTokenError
 from app.utils.logging import configure_logging
 from app.utils.logging import log
 from app.websocket.twilio_media import TwilioMediaSession
+from app.websocket.twilio_text_streaming import TwilioTextStreamingSession
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -30,14 +31,25 @@ configure_logging(settings.log_level)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.validate_startup()
+    text_streaming_active = settings.voice_pipeline == "text_streaming"
     log.info(
-        "openai_realtime_config",
-        model=settings.openai_realtime_model,
-        voice=settings.openai_realtime_voice,
-        speed=settings.openai_realtime_speed,
-        tts_provider=settings.tts_provider,
-        cartesia_model=settings.cartesia_model_id if settings.tts_provider == "cartesia" else None,
-        cartesia_voice_id_suffix=settings.cartesia_voice_id[-6:] if settings.tts_provider == "cartesia" and settings.cartesia_voice_id else None,
+        "voice_pipeline_config",
+        active_voice_pipeline=settings.voice_pipeline,
+        active_stt_provider="deepgram" if text_streaming_active else "openai_realtime",
+        active_llm_provider="openai_text" if text_streaming_active else "openai_realtime",
+        active_tts_provider="cartesia_streaming" if text_streaming_active else "openai_realtime",
+        openai_realtime_model=settings.openai_realtime_model,
+        openai_realtime_voice=settings.openai_realtime_voice,
+        openai_realtime_speed=settings.openai_realtime_speed,
+        openai_text_model=settings.openai_text_model,
+        cartesia_enabled=bool(text_streaming_active and settings.cartesia_api_key and settings.cartesia_voice_id),
+        cartesia_model=settings.cartesia_model_id if text_streaming_active else None,
+        cartesia_voice_id_suffix=settings.cartesia_voice_id[-6:] if text_streaming_active and settings.cartesia_voice_id else None,
+        cartesia_sample_rate=settings.cartesia_sample_rate if text_streaming_active else None,
+        cartesia_encoding=settings.cartesia_encoding if text_streaming_active else None,
+        deepgram_enabled=bool(text_streaming_active and settings.deepgram_api_key),
+        deepgram_model=settings.deepgram_model if text_streaming_active else None,
+        deepgram_language=settings.deepgram_language if text_streaming_active else None,
     )
     await init_db()
     memory = ConversationMemory(settings)
@@ -111,7 +123,16 @@ async def _twilio_media_authenticated(websocket: WebSocket, stream_token: str | 
         )
         await websocket.close(code=1008)
         return
-    session = TwilioMediaSession(
+    session_cls = TwilioTextStreamingSession if settings.voice_pipeline == "text_streaming" else TwilioMediaSession
+    log.info(
+        "twilio_ws_session_selected",
+        active_voice_pipeline=settings.voice_pipeline,
+        active_stt_provider="deepgram" if settings.voice_pipeline == "text_streaming" else "openai_realtime",
+        active_llm_provider="openai_text" if settings.voice_pipeline == "text_streaming" else "openai_realtime",
+        active_tts_provider="cartesia_streaming" if settings.voice_pipeline == "text_streaming" else "openai_realtime",
+        session_class=session_cls.__name__,
+    )
+    session = session_cls(
         websocket,
         settings,
         app.state.memory,

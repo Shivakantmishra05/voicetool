@@ -25,10 +25,14 @@ class Settings(BaseSettings):
     stream_token_secret: str | None = None
     stream_token_ttl_seconds: int = 120
 
+    voice_pipeline: str = "openai_realtime"
     openai_api_key: str
     openai_realtime_model: str = "gpt-realtime"
     openai_realtime_voice: str = "marin"
     openai_realtime_speed: float = 1.0
+    openai_text_model: str = "gpt-4.1-mini"
+    openai_text_timeout_seconds: float = 4.0
+    openai_text_max_tokens: int = 80
     openai_summary_model: str = "gpt-4.1-mini"
     openai_transcription_model: str = "gpt-4o-mini-transcribe"
 
@@ -56,6 +60,7 @@ class Settings(BaseSettings):
     cartesia_version: str = "2026-03-01"
     cartesia_language: str = "hi"
     cartesia_sample_rate: int = 8000
+    cartesia_encoding: str = "pcm_s16le"
 
     rate_limit_per_minute: int = 120
     call_idle_timeout_seconds: int = 45
@@ -133,6 +138,19 @@ class Settings(BaseSettings):
                 missing.append("SUPABASE_KEY service-role/server key")
         if self.deepgram_utterance_end_ms < 1000:
             raise RuntimeError("DEEPGRAM_UTTERANCE_END_MS must be >= 1000 for Deepgram live streaming")
+        if self.voice_pipeline not in {"openai_realtime", "text_streaming"}:
+            raise RuntimeError("VOICE_PIPELINE must be openai_realtime or text_streaming")
+        if self.voice_pipeline == "text_streaming":
+            if not self.deepgram_api_key:
+                missing.append("DEEPGRAM_API_KEY")
+            if not self.cartesia_api_key:
+                missing.append("CARTESIA_API_KEY")
+            if not self.cartesia_voice_id:
+                missing.append("CARTESIA_VOICE_ID")
+            if self.cartesia_sample_rate != 8000:
+                raise RuntimeError("CARTESIA_SAMPLE_RATE must be 8000 for Twilio Media Streams")
+            if self.cartesia_encoding not in {"pcm_s16le", "pcm_mulaw"}:
+                raise RuntimeError("CARTESIA_ENCODING must be pcm_s16le or pcm_mulaw")
         if self.elevenlabs_output_format not in {"pcm_16000", "ulaw_8000"}:
             raise RuntimeError("ELEVENLABS_OUTPUT_FORMAT must be pcm_16000 or ulaw_8000 for Twilio playback")
         if self.tts_provider not in {"openai", "cartesia"}:
