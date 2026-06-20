@@ -117,7 +117,7 @@ class TwilioTextStreamingSession(TwilioMediaSession):
         self.stt = DeepgramSTTStream(self.settings, self._on_deepgram_transcript, self._on_deepgram_speech_started)
         await self.stt.connect()
         self._safe_transition(CallPhase.SESSION_READY, "text_streaming_ready")
-        await self._speak_text(self._greeting_text(), reason="greeting")
+        self._spawn(self._speak_text(self._greeting_text(), reason="greeting"), "text_streaming_greeting")
         self._spawn(self._silence_watchdog(), "silence_watchdog")
 
     async def _media(self, message: dict) -> None:
