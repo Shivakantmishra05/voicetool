@@ -45,7 +45,7 @@ from app.utils.logging import call_sid_ctx, log
 
 
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
-GREETING_LOCK_SECONDS = 2.2
+GREETING_LOCK_SECONDS = 4.0  # was 2.2 — greeting ~3-4s, old value unlocked before completion
 BARGE_IN_DEBOUNCE_SECONDS = 0.35
 RESPONSE_AUDIO_TIMEOUT_SECONDS = 2.5
 SILENCE_PROMPT_SECONDS = 8.0
@@ -954,9 +954,9 @@ class TwilioMediaSession:
                             "transcription": {"model": self.settings.openai_transcription_model},
                             "turn_detection": {
                                 "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 450,
-                                "silence_duration_ms": 500,
+                                "threshold": 0.80,           # was 0.5 — too sensitive, AI heard its own echo and self-interrupted
+                                "prefix_padding_ms": 300,    # was 450 — genuine speech now detected faster
+                                "silence_duration_ms": 800,  # was 500 — gives user time to finish sentence without mid-cut
                                 "idle_timeout_ms": 6000,
                                 "interrupt_response": False,
                                 "create_response": False,
@@ -1270,7 +1270,7 @@ class TwilioMediaSession:
             or getattr(self.claims, "customer_name", None)
         )
         if not customer_name:
-            return "Namaste sir... DreamHome Properties se Riya bol rahi hoon."
+            return "Haan ji, main Riya bol rahi hoon DreamHome se. Property enquiry ke baare mein call kiya tha."
         return OUTGOING_CONFIRM_LINE.format(customer_name=customer_name)
 
     def _build_greeting_instructions(self) -> str:
