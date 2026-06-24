@@ -267,6 +267,33 @@ class TwilioTextStreamingSession(TwilioMediaSession):
 
         await self._generate_text_response(self._build_response_instructions(), reason="user_transcript")
 
+    async def _silence_watchdog(self) -> None:
+        while not self.stopping:
+            await asyncio.sleep(2.0)
+            if self.call_started_at and monotonic() - self.call_started_at >= 210.0:
+                log.info("call_max_duration_reached", max_call_seconds=210.0, pipeline="text_streaming")
+                await self._speak_text("Sir, main details WhatsApp pe bhej deti hoon. Namaste ji.", reason="max_duration_close")
+                self._spawn(self._stop_after_response(), "close_after_response")
+                return
+            if self.assistant_speaking or self.caller_speaking or monotonic() < self.text_greeting_locked_until:
+                continue
+            idle_seconds = monotonic() - self.last_activity_at
+            if idle_seconds < 8.0:
+                continue
+            self.last_activity_at = monotonic()
+            self.silence_prompt_count += 1
+            log.info(
+                "fallback_triggered",
+                reason="text_silence_watchdog",
+                idle_seconds=round(idle_seconds, 2),
+                silence_prompt_count=self.silence_prompt_count,
+            )
+            if self.silence_prompt_count >= 2:
+                await self._speak_text("Sir, main details WhatsApp pe bhej deti hoon. Namaste ji.", reason="silence_close")
+                self._spawn(self._stop_after_response(), "close_after_response")
+                return
+            await self._speak_text("Hello sir?", reason="silence_watchdog")
+
     async def _generate_text_response(self, instructions: str, *, reason: str) -> None:
         if monotonic() < self.llm_unavailable_until:
             log.warning("llm_response_skipped_during_backoff", reason=reason)
