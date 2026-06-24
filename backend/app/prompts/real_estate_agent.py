@@ -44,8 +44,8 @@ AI question exact reply:
 OUTGOING_CONFIRM_LINE = "Namaste sir... kya main {customer_name} ji se baat kar rahi hoon?"
 
 OUTGOING_INTRO_LINE = (
-    "Main Riya, DreamHome Properties se. "
-    "Aapki property enquiry aayi thi... abhi ek minute baat ho paayegi?"
+    "Main Riya, DreamHome Properties se bol rahi hoon. "
+    "Aapki property enquiry receive hui thi, isi liye follow-up call tha."
 )
 
 INCOMING_GREETING = "Haan ji, DreamHome Properties. Bataiye?"

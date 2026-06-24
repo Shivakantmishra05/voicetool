@@ -69,6 +69,27 @@ UNSUPPORTED_AREA_RESPONSE = (
 )
 AI_IDENTITY_RESPONSE_HINDI = "Nahi sir, main Riya hoon DreamHome se."
 AI_IDENTITY_RESPONSE_ENGLISH = "No sir, this is Riya from DreamHome."
+CALL_REASON_RESPONSE = "Aapki property enquiry receive hui thi sir, isi liye follow-up call tha."
+CALL_REASON_TERMS = (
+    "call kyu",
+    "call kyun",
+    "call kyon",
+    "kyu call",
+    "kyun call",
+    "kyon call",
+    "kyu kiya",
+    "kyun kiya",
+    "kyon kiya",
+    "call kyun kiya",
+    "call kyon kiya",
+    "why did you call",
+    "why have you called",
+    "आपने call क्यों",
+    "call क्यों किया",
+    "क्यों call",
+    "क्यों किया",
+    "किसलिए call",
+)
 UNSUPPORTED_INVENTORY_TERMS = (
     "sector 62",
     "sector-62",
@@ -1119,6 +1140,14 @@ class TwilioMediaSession:
             return
         forced_response = self._forced_safety_response(text)
         if forced_response:
+            if not self.customer_memory.get("intro_delivered"):
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {
+                        "intro_delivered": True,
+                        "conversation_stage": "INTRO",
+                    },
+                )
             if self._using_cartesia_tts():
                 await self._speak_fixed_text(
                     forced_response,
@@ -1141,11 +1170,18 @@ class TwilioMediaSession:
                     "conversation_stage": "INTRO",
                 },
             )
+            if self._using_cartesia_tts():
+                await self._speak_fixed_text(
+                    OUTGOING_INTRO_LINE,
+                    response_id="cartesia-outgoing-intro",
+                    reason="outgoing_intro",
+                )
+                return
             await self._request_assistant_response(
-                self._build_response_instructions()
-                + "\n\nCaller has replied to the opening. Follow the prompt's Step 2 intro naturally. "
-                "Do not start property discovery in this turn.",
+                "Say exactly this one line, then stop. Do not add anything else:\n"
+                f"{OUTGOING_INTRO_LINE}",
                 reason="outgoing_intro",
+                force=True,
             )
             return
         await self._request_assistant_response(
@@ -1209,6 +1245,9 @@ class TwilioMediaSession:
 
     def _forced_safety_response(self, text: str) -> str | None:
         lowered = str(text or "").lower()
+        if any(term in lowered for term in CALL_REASON_TERMS):
+            log.info("call_reason_forced_response", transcript_preview=_preview(text, 180))
+            return CALL_REASON_RESPONSE
         if any(term in lowered for term in UNSUPPORTED_INVENTORY_TERMS):
             log.warning("unsupported_inventory_forced_response", transcript_preview=_preview(text, 180))
             return UNSUPPORTED_AREA_RESPONSE

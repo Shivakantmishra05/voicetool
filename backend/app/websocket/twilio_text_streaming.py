@@ -27,6 +27,7 @@ from app.services.stt import DeepgramSTTStream
 from app.services.supabase_crm import SupabaseCRM
 from app.telephony.stream_auth import StreamClaims, StreamTokenService
 from app.utils.logging import call_sid_ctx, log
+from app.prompts.real_estate_agent import OUTGOING_INTRO_LINE
 from app.websocket.twilio_media import CallPhase, TwilioMediaSession
 
 TEXT_GREETING_LOCK_SECONDS = 3.5
@@ -260,6 +261,12 @@ class TwilioTextStreamingSession(TwilioMediaSession):
 
         forced_response = self._forced_safety_response(text)
         if forced_response:
+            if not self.customer_memory.get("intro_delivered"):
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {"intro_delivered": True, "conversation_stage": "INTRO"},
+                )
+                self._drop_last_short_user_turn(text, reason="forced_pre_intro")
             await self._speak_text(forced_response, reason="forced_safety_response")
             return
 
@@ -268,14 +275,26 @@ class TwilioTextStreamingSession(TwilioMediaSession):
                 self.state.call_sid,
                 {"intro_delivered": True, "conversation_stage": "INTRO"},
             )
-            await self._generate_text_response(
-                self._build_response_instructions()
-                + "\n\nCaller has replied to the opening. Follow Step 2 intro naturally. Do not start discovery.",
-                reason="outgoing_intro",
-            )
+            self._drop_last_short_user_turn(text, reason="intro_confirmation")
+            await self._speak_text(OUTGOING_INTRO_LINE, reason="outgoing_intro")
             return
 
         await self._generate_text_response(self._build_response_instructions(), reason="user_transcript")
+
+    def _drop_last_short_user_turn(self, text: str, *, reason: str) -> None:
+        if len(str(text or "").strip()) > 18:
+            return
+        if not self.transcript_turns:
+            return
+        last_turn = self.transcript_turns[-1]
+        if str(last_turn.get("role") or last_turn.get("speaker") or "").lower() != "user":
+            return
+        removed = self.transcript_turns.pop()
+        log.info(
+            "short_intro_confirmation_removed_from_prompt",
+            reason=reason,
+            chars=len(str(removed.get("text") or "")),
+        )
 
     async def _silence_watchdog(self) -> None:
         while not self.stopping:
