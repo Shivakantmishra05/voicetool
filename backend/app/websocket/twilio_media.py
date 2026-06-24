@@ -1163,6 +1163,12 @@ class TwilioMediaSession:
             )
             return
         if not self.customer_memory.get("intro_delivered"):
+            # If no customer_name, greeting was already the intro (direct intro line).
+            # Skip OUTGOING_INTRO_LINE to avoid speaking intro twice.
+            customer_name = (
+                str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
+                or getattr(self.claims, "customer_name", None)
+            )
             self.customer_memory = await self.call_memory.update_memory(
                 self.state.call_sid,
                 {
@@ -1170,19 +1176,23 @@ class TwilioMediaSession:
                     "conversation_stage": "INTRO",
                 },
             )
-            if self._using_cartesia_tts():
-                await self._speak_fixed_text(
-                    OUTGOING_INTRO_LINE,
-                    response_id="cartesia-outgoing-intro",
+            self._drop_last_short_user_turn(text, reason="intro_confirmation")
+            if customer_name:
+                # Greeting was a confirm-name line — now speak the actual intro
+                if self._using_cartesia_tts():
+                    await self._speak_fixed_text(
+                        OUTGOING_INTRO_LINE,
+                        response_id="cartesia-outgoing-intro",
+                        reason="outgoing_intro",
+                    )
+                    return
+                await self._request_assistant_response(
+                    "Say exactly this one line, then stop. Do not add anything else:\n"
+                    f"{OUTGOING_INTRO_LINE}",
                     reason="outgoing_intro",
+                    force=True,
                 )
-                return
-            await self._request_assistant_response(
-                "Say exactly this one line, then stop. Do not add anything else:\n"
-                f"{OUTGOING_INTRO_LINE}",
-                reason="outgoing_intro",
-                force=True,
-            )
+            # No customer_name: greeting was already the intro — skip to discovery
             return
         await self._request_assistant_response(
             self._build_response_instructions(),
@@ -1215,7 +1225,9 @@ class TwilioMediaSession:
         if self.customer_memory.get("callback_requested"):
             callback_time = self.customer_memory.get("callback_time") or "unspecified time"
             return (
-                build_dynamic_response_context(
+                SYSTEM_PROMPT
+                + "\n\n"
+                + build_dynamic_response_context(
                     get_persona_context(language),
                     build_memory_context(self.customer_memory),
                     language_context=get_language_context(self.customer_memory),
@@ -1231,10 +1243,14 @@ class TwilioMediaSession:
         )
 
         return (
-            build_dynamic_response_context(
+            SYSTEM_PROMPT
+            + "\n\n"
+            + build_dynamic_response_context(
                 get_persona_context(language),
                 build_memory_context(self.customer_memory),
                 stage_context=get_stage_context(self.customer_memory) if stage in ("SITE_VISIT_BOOKING", "CLOSING") else "",
+                profile_context=get_profile_context(self.customer_memory),
+                lead_score_context=get_lead_score_context(self.customer_memory),
                 objection_context=get_objection_context(self.customer_memory) if self.customer_memory.get("objections") else "",
                 language_context=get_language_context(self.customer_memory),
                 matched_project_context=project_context(self.customer_memory),
