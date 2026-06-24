@@ -186,12 +186,22 @@ class TwilioTextStreamingSession(TwilioMediaSession):
         if monotonic() < self.text_greeting_locked_until:
             log.info("barge_in_ignored_during_text_greeting", speech_ms=speech_ms)
             return
-        if not (self.assistant_speaking or self.active_llm_task):
+        llm_running = self.active_llm_task is not None and not self.active_llm_task.done()
+        if not (self.assistant_speaking or self.active_tts_context_id or llm_running):
             log.info("barge_in_ignored_no_text_audio", speech_ms=speech_ms)
             return
-        log.info("barge_in_confirmed", speech_ms=speech_ms, pipeline="text_streaming")
+        log.info(
+            "barge_in_confirmed",
+            speech_ms=speech_ms,
+            pipeline="text_streaming",
+            assistant_speaking=self.assistant_speaking,
+            llm_running=llm_running,
+            tts_active=bool(self.active_tts_context_id),
+        )
+        should_clear_twilio = self.assistant_speaking or bool(self.active_tts_context_id)
         await self._cancel_active_generation("barge_in")
-        await self._clear_twilio_buffer()
+        if should_clear_twilio:
+            await self._clear_twilio_buffer()
 
     async def _on_deepgram_transcript(self, transcript: str, is_final: bool, confidence: float | None) -> None:
         if not transcript.strip():
@@ -342,6 +352,9 @@ class TwilioTextStreamingSession(TwilioMediaSession):
             log.exception("llm_stream_failed", reason=reason, error=str(exc), backoff_seconds=10)
             await self._speak_text(_LLM_UNAVAILABLE_FALLBACK, reason="llm_error_fallback")
             return
+        finally:
+            if self.active_llm_task is asyncio.current_task():
+                self.active_llm_task = None
         if full_response:
             self._add_transcript_turn("assistant", full_response)
         log.info("llm_stream_finished", reason=reason, chars=len(full_response))

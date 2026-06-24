@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     deepgram_endpointing_ms: int = 500
     deepgram_utterance_end_ms: int = 1500
     min_tts_fragment_chars: int = 18
-    max_tts_fragment_chars: int = 80
+    max_tts_fragment_chars: int = 120
 
     admin_username: str | None = None
     admin_password: str | None = None
