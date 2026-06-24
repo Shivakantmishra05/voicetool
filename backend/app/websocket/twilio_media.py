@@ -115,7 +115,16 @@ class CallPhase(StrEnum):
 ALLOWED_PHASE_TRANSITIONS: dict[CallPhase, set[CallPhase]] = {
     CallPhase.NEW: {CallPhase.TWILIO_CONNECTED, CallPhase.FAILED},
     CallPhase.TWILIO_CONNECTED: {CallPhase.STREAM_STARTED, CallPhase.CALL_ENDING, CallPhase.FAILED},
-    CallPhase.STREAM_STARTED: {CallPhase.OPENAI_CONNECTING, CallPhase.CALL_ENDING, CallPhase.FAILED},
+    CallPhase.STREAM_STARTED: {
+        CallPhase.OPENAI_CONNECTING,
+        CallPhase.SESSION_READY,
+        CallPhase.ASSISTANT_SPEAKING,
+        CallPhase.USER_SPEAKING,
+        CallPhase.PROCESSING_USER,
+        CallPhase.WAITING_FOR_USER,
+        CallPhase.CALL_ENDING,
+        CallPhase.FAILED,
+    },
     CallPhase.OPENAI_CONNECTING: {CallPhase.OPENAI_CONNECTED, CallPhase.CALL_ENDING, CallPhase.FAILED},
     CallPhase.OPENAI_CONNECTED: {CallPhase.SESSION_UPDATING, CallPhase.CALL_ENDING, CallPhase.FAILED},
     CallPhase.SESSION_UPDATING: {CallPhase.SESSION_READY, CallPhase.CALL_ENDING, CallPhase.FAILED},
