@@ -4,6 +4,7 @@ import json
 from time import monotonic
 from typing import Any
 
+import httpx
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.config import Settings
@@ -54,6 +55,7 @@ class TwilioTextStreamingSession(TwilioMediaSession):
         self.current_llm_first_token_at: float | None = None
         self.current_tts_started_at: float | None = None
         self.current_tts_first_audio_at: float | None = None
+        self.llm_unavailable_until = 0.0
 
     async def run(self) -> None:
         await self.websocket.accept()
@@ -217,6 +219,10 @@ class TwilioTextStreamingSession(TwilioMediaSession):
         await self._generate_text_response(self._build_response_instructions(), reason="user_transcript")
 
     async def _generate_text_response(self, instructions: str, *, reason: str) -> None:
+        if monotonic() < self.llm_unavailable_until:
+            log.warning("llm_response_skipped_during_backoff", reason=reason)
+            await self._speak_text(_LLM_UNAVAILABLE_FALLBACK, reason="llm_unavailable_fallback")
+            return
         await self._cancel_active_generation("new_response")
         self.active_llm_task = self._spawn(self._run_text_generation(instructions, reason=reason), "openai_text_generation")
 
@@ -240,14 +246,26 @@ class TwilioTextStreamingSession(TwilioMediaSession):
                 yield delta
 
         full_response = ""
-        async for sentence in sentence_fragments(
-            deltas(),
-            min_chars=self.settings.min_tts_fragment_chars,
-            max_chars=self.settings.max_tts_fragment_chars,
-        ):
-            full_response = f"{full_response} {sentence}".strip()
-            log.info("sentence_chunk_ready", reason=reason, chars=len(sentence), preview=sentence[:80])
-            await self._speak_text(sentence, reason="llm_sentence")
+        try:
+            async for sentence in sentence_fragments(
+                deltas(),
+                min_chars=self.settings.min_tts_fragment_chars,
+                max_chars=self.settings.max_tts_fragment_chars,
+            ):
+                full_response = f"{full_response} {sentence}".strip()
+                log.info("sentence_chunk_ready", reason=reason, chars=len(sentence), preview=sentence[:80])
+                await self._speak_text(sentence, reason="llm_sentence")
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response else None
+            self.llm_unavailable_until = monotonic() + 20.0
+            log.exception("llm_stream_failed", reason=reason, status_code=status_code, backoff_seconds=20)
+            await self._speak_text(_LLM_UNAVAILABLE_FALLBACK, reason="llm_error_fallback")
+            return
+        except Exception as exc:
+            self.llm_unavailable_until = monotonic() + 10.0
+            log.exception("llm_stream_failed", reason=reason, error=str(exc), backoff_seconds=10)
+            await self._speak_text(_LLM_UNAVAILABLE_FALLBACK, reason="llm_error_fallback")
+            return
         if full_response:
             self._add_transcript_turn("assistant", full_response)
         log.info("llm_stream_finished", reason=reason, chars=len(full_response))
@@ -313,3 +331,6 @@ class TwilioTextStreamingSession(TwilioMediaSession):
             await self.stt.close()
         await self.streaming_tts.close()
         await self.text_llm.close()
+
+
+_LLM_UNAVAILABLE_FALLBACK = "Sir, ek second. System slow chal raha hai, main details WhatsApp pe bhej deti hoon."
