@@ -61,6 +61,8 @@ class TwilioTextStreamingSession(TwilioMediaSession):
         self.llm_unavailable_until = 0.0
         self.text_greeting_locked_until = 0.0
         self.text_barge_in_task: asyncio.Task | None = None
+        self.twilio_media_frames_received = 0
+        self.deepgram_audio_frames_sent = 0
 
     async def run(self) -> None:
         await self.websocket.accept()
@@ -131,14 +133,34 @@ class TwilioTextStreamingSession(TwilioMediaSession):
     async def _media(self, message: dict) -> None:
         self.last_activity_at = monotonic()
         payload = (message.get("media") or {}).get("payload")
-        if not payload or not self.stt:
+        if not payload:
+            log.warning("twilio_media_frame_missing_payload")
+            return
+        if not self.stt:
+            log.warning("twilio_media_frame_dropped_no_stt")
             return
         try:
             audio = base64.b64decode(payload, validate=True)
         except Exception:
             self.metrics.inc("voice_bad_media_payload_total")
+            log.warning("twilio_media_frame_bad_payload")
             return
+        self.twilio_media_frames_received += 1
+        if self.twilio_media_frames_received <= 3 or self.twilio_media_frames_received % 50 == 0:
+            log.info(
+                "twilio_media_frame_received",
+                frames=self.twilio_media_frames_received,
+                bytes=len(audio),
+                stream_sid=self.state.stream_sid if self.state else None,
+            )
         await self.stt.send_audio(audio)
+        self.deepgram_audio_frames_sent += 1
+        if self.deepgram_audio_frames_sent <= 3 or self.deepgram_audio_frames_sent % 50 == 0:
+            log.info(
+                "deepgram_audio_frame_sent",
+                frames=self.deepgram_audio_frames_sent,
+                bytes=len(audio),
+            )
         self.metrics.inc("voice_twilio_media_frames_total")
 
     async def _on_deepgram_speech_started(self) -> None:
