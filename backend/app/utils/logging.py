@@ -10,7 +10,12 @@ call_sid_ctx: ContextVar[str] = ContextVar("call_sid", default="-")
 
 
 def configure_logging(level: str) -> None:
-    logging.basicConfig(stream=sys.stdout, level=level.upper(), format="%(message)s")
+    root = logging.getLogger()
+    root.handlers.clear()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root.addHandler(handler)
+    root.setLevel(level.upper())
     structlog.configure(
         processors=[
             add_context,
@@ -19,7 +24,7 @@ def configure_logging(level: str) -> None:
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, level.upper(), logging.INFO)),
-        logger_factory=structlog.stdlib.LoggerFactory(),
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
         cache_logger_on_first_use=True,
     )
 
@@ -35,4 +40,3 @@ def new_request_id() -> str:
 
 
 log = structlog.get_logger()
-

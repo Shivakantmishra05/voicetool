@@ -29,6 +29,9 @@ from app.telephony.stream_auth import StreamClaims, StreamTokenService
 from app.utils.logging import call_sid_ctx, log
 from app.websocket.twilio_media import CallPhase, TwilioMediaSession
 
+TEXT_GREETING_LOCK_SECONDS = 3.5
+TEXT_BARGE_IN_DEBOUNCE_SECONDS = 0.45
+
 
 class TwilioTextStreamingSession(TwilioMediaSession):
     def __init__(
@@ -56,6 +59,8 @@ class TwilioTextStreamingSession(TwilioMediaSession):
         self.current_tts_started_at: float | None = None
         self.current_tts_first_audio_at: float | None = None
         self.llm_unavailable_until = 0.0
+        self.text_greeting_locked_until = 0.0
+        self.text_barge_in_task: asyncio.Task | None = None
 
     async def run(self) -> None:
         await self.websocket.accept()
@@ -119,6 +124,7 @@ class TwilioTextStreamingSession(TwilioMediaSession):
         self.stt = DeepgramSTTStream(self.settings, self._on_deepgram_transcript, self._on_deepgram_speech_started)
         await self.stt.connect()
         self._safe_transition(CallPhase.SESSION_READY, "text_streaming_ready")
+        self.text_greeting_locked_until = monotonic() + TEXT_GREETING_LOCK_SECONDS
         self._spawn(self._speak_text(self._greeting_text(), reason="greeting"), "text_streaming_greeting")
         self._spawn(self._silence_watchdog(), "silence_watchdog")
 
@@ -137,11 +143,31 @@ class TwilioTextStreamingSession(TwilioMediaSession):
 
     async def _on_deepgram_speech_started(self) -> None:
         self.last_activity_at = monotonic()
-        log.info("barge_in_detected", assistant_speaking=self.assistant_speaking)
         self.caller_speaking = True
         self.caller_speech_started_at = monotonic()
         self.current_user_speech_started_at = self.caller_speech_started_at
         self._safe_transition(CallPhase.USER_SPEAKING, "deepgram_speech_started")
+        log.info(
+            "barge_in_detected",
+            assistant_speaking=self.assistant_speaking,
+            greeting_locked=monotonic() < self.text_greeting_locked_until,
+        )
+        if self.text_barge_in_task and not self.text_barge_in_task.done():
+            return
+        self.text_barge_in_task = self._spawn(self._confirm_text_barge_in_after_delay(), "text_barge_in_debounce")
+
+    async def _confirm_text_barge_in_after_delay(self) -> None:
+        await asyncio.sleep(TEXT_BARGE_IN_DEBOUNCE_SECONDS)
+        if self.stopping or not self.caller_speaking or not self.caller_speech_started_at:
+            return
+        speech_ms = round((monotonic() - self.caller_speech_started_at) * 1000, 2)
+        if monotonic() < self.text_greeting_locked_until:
+            log.info("barge_in_ignored_during_text_greeting", speech_ms=speech_ms)
+            return
+        if not (self.assistant_speaking or self.active_llm_task):
+            log.info("barge_in_ignored_no_text_audio", speech_ms=speech_ms)
+            return
+        log.info("barge_in_confirmed", speech_ms=speech_ms, pipeline="text_streaming")
         await self._cancel_active_generation("barge_in")
         await self._clear_twilio_buffer()
 
@@ -158,6 +184,7 @@ class TwilioTextStreamingSession(TwilioMediaSession):
             return
         self.caller_speaking = False
         self.caller_speech_started_at = None
+        self.text_greeting_locked_until = 0.0
         self.current_user_final_at = monotonic()
         log.info(
             "stt_final_latency",
@@ -283,7 +310,8 @@ class TwilioTextStreamingSession(TwilioMediaSession):
         try:
             async for context_id, payload in self.streaming_tts.stream_ulaw_payloads(text, call_sid=self.state.call_sid):
                 self.active_tts_context_id = context_id
-                if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING:
+                protected_greeting = reason == "greeting" and monotonic() < self.text_greeting_locked_until
+                if (self.caller_speaking or self.phase == CallPhase.USER_SPEAKING) and not protected_greeting:
                     log.info("cartesia_stream_audio_skipped", reason="caller_speaking", response_id=response_id)
                     break
                 if self.current_tts_first_audio_at is None:
