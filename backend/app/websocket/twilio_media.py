@@ -4,6 +4,7 @@ import contextlib
 import inspect
 import json
 from collections import deque
+from dataclasses import dataclass
 from enum import StrEnum
 from time import monotonic
 from typing import Any
@@ -48,6 +49,7 @@ OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 GREETING_LOCK_SECONDS = 4.0  # was 2.2 — greeting ~3-4s, old value unlocked before completion
 BARGE_IN_DEBOUNCE_SECONDS = 0.35
 RESPONSE_AUDIO_TIMEOUT_SECONDS = 2.5
+CARTESIA_RESPONSE_TIMEOUT_SECONDS = 4.0
 SILENCE_PROMPT_SECONDS = 8.0
 MAX_SILENCE_PROMPTS = 2
 MAX_CALL_SECONDS = 210.0
@@ -133,6 +135,74 @@ class CallPhase(StrEnum):
     FAILED = "FAILED"
 
 
+class GreetingState(StrEnum):
+    NOT_STARTED = "NOT_STARTED"
+    PLAYING = "PLAYING"
+    COMPLETED = "COMPLETED"
+
+
+@dataclass
+class GreetingManager:
+    state: GreetingState = GreetingState.NOT_STARTED
+    response_id: str | None = None
+    started_at: float | None = None
+    completed_at: float | None = None
+
+    def start(self, response_id: str) -> None:
+        if self.state == GreetingState.COMPLETED:
+            return
+        self.state = GreetingState.PLAYING
+        self.response_id = response_id
+        self.started_at = monotonic()
+        self.completed_at = None
+
+    def complete(self, response_id: str | None = None) -> bool:
+        if self.state != GreetingState.PLAYING:
+            return False
+        if response_id and self.response_id and response_id != self.response_id:
+            return False
+        self.state = GreetingState.COMPLETED
+        self.completed_at = monotonic()
+        return True
+
+    @property
+    def is_playing(self) -> bool:
+        return self.state == GreetingState.PLAYING
+
+    @property
+    def is_completed(self) -> bool:
+        return self.state == GreetingState.COMPLETED
+
+
+@dataclass
+class ResponseManager:
+    generation: int = 0
+    response_id: str | None = None
+    playback_id: str | None = None
+    cancellation_reason: str | None = None
+
+    def begin_response(self, response_id: str | None) -> None:
+        self.response_id = response_id
+        self.cancellation_reason = None
+
+    def begin_playback(self, playback_id: str | None) -> int:
+        self.generation += 1
+        self.playback_id = playback_id
+        self.cancellation_reason = None
+        return self.generation
+
+    def is_current(self, generation: int, playback_id: str | None = None) -> bool:
+        if generation != self.generation:
+            return False
+        return playback_id is None or self.playback_id == playback_id
+
+    def cancel(self, reason: str) -> None:
+        self.generation += 1
+        self.response_id = None
+        self.playback_id = None
+        self.cancellation_reason = reason
+
+
 ALLOWED_PHASE_TRANSITIONS: dict[CallPhase, set[CallPhase]] = {
     CallPhase.NEW: {CallPhase.TWILIO_CONNECTED, CallPhase.FAILED},
     CallPhase.TWILIO_CONNECTED: {CallPhase.STREAM_STARTED, CallPhase.CALL_ENDING, CallPhase.FAILED},
@@ -196,6 +266,9 @@ class TwilioMediaSession:
         self.openai_audio_fallback_parts: dict[str, list[str]] = {}
         self.cartesia_tts_active: set[str] = set()
         self.cartesia_playback_started: set[str] = set()
+        self.cartesia_spoken_response_ids: set[str] = set()
+        self.greeting_manager = GreetingManager()
+        self.response_manager = ResponseManager()
         self.greeting_clear_locked_until = 0.0
         self.greeting_response_id: str | None = None
         self.greeting_completed = False
@@ -228,6 +301,7 @@ class TwilioMediaSession:
         self.session_update_ack_at: float | None = None
         self.session_updated_at: float | None = None
         self.response_create_sent_at: float | None = None
+        self.pending_response_create_reason: str | None = None
         self.greeting_response_create_at: float | None = None
         self.first_audio_delta_at: float | None = None
         self.openai_output_audio_format: str | None = None
@@ -310,6 +384,7 @@ class TwilioMediaSession:
             self.call = await repo.start_call(call_sid, stream_sid, caller)
 
         log.info("call_started", stream_sid=stream_sid, media_format=media_format, provider="openai_realtime")
+        log.info("call_connected", call_sid=call_sid, stream_sid=stream_sid)
         log.info(
             "voice_output_provider",
             provider=self.settings.tts_provider,
@@ -317,6 +392,14 @@ class TwilioMediaSession:
             cartesia_model=self.settings.cartesia_model_id if self.cartesia_tts else None,
             cartesia_voice_id_suffix=self.settings.cartesia_voice_id[-6:] if self.cartesia_tts and self.settings.cartesia_voice_id else None,
         )
+        if self.cartesia_tts:
+            log.info(
+                "cartesia_ready",
+                model=self.settings.cartesia_model_id,
+                voice_id_suffix=self.settings.cartesia_voice_id[-6:] if self.settings.cartesia_voice_id else None,
+                sample_rate=self.settings.cartesia_sample_rate,
+                encoding=self.settings.cartesia_encoding,
+            )
         self.openai_connect_task = self._spawn(self._connect_openai(request_greeting=True), "openai_realtime_connector")
         self._spawn(self._silence_watchdog(), "silence_watchdog")
 
@@ -424,13 +507,23 @@ class TwilioMediaSession:
         self._transition(CallPhase.SESSION_READY, "session_ready")
         await self._flush_early_audio()
         if request_greeting:
-            self.greeting_clear_locked_until = monotonic() + GREETING_LOCK_SECONDS
-            log.info("greeting_started", lock_seconds=GREETING_LOCK_SECONDS)
-            await self._request_assistant_response(
-                self._build_greeting_instructions(),
-                reason="greeting",
-                force=True,
-            )
+            if self._using_cartesia_tts():
+                greeting_text = self._greeting_text()
+                if not self._greeting_has_customer_name():
+                    self.customer_memory = await self.call_memory.update_memory(
+                        self.state.call_sid,
+                        {"intro_delivered": True, "conversation_stage": "INTRO"},
+                    )
+                await self._speak_fixed_text(greeting_text, response_id="cartesia-greeting", reason="greeting")
+            else:
+                self.greeting_manager.start("openai-greeting-pending")
+                self.greeting_clear_locked_until = monotonic() + GREETING_LOCK_SECONDS
+                log.info("greeting_started", mode="openai_audio", lock_seconds=GREETING_LOCK_SECONDS)
+                await self._request_assistant_response(
+                    self._build_greeting_instructions(),
+                    reason="greeting",
+                    force=True,
+                )
 
     async def _media(self, message: dict) -> None:
         self.last_activity_at = monotonic()
@@ -546,22 +639,26 @@ class TwilioMediaSession:
         if event_type in {"response.output_item.added", "response.content_part.added"}:
             log.info("openai_response_event", openai_event=event_type, response_id=event.get("response_id") or (event.get("response") or {}).get("id"))
             return
+        if event_type in {"response.content_part.done", "response.output_item.done"}:
+            response_id = event.get("response_id") or self.current_response_id or "active"
+            text = self._extract_text_from_response_event(event)
+            if text:
+                self._handle_assistant_text_completed(response_id, text, source=event_type)
+            else:
+                log.info("openai_text_event_without_text", openai_event=event_type, response_id=response_id)
+            return
         if event_type in {"response.audio.delta", "response.output_audio.delta"}:
             self.openai_audio_delta_count += 1
             if self._using_cartesia_tts():
                 response_id = event.get("response_id") or self.current_response_id or "active"
-                delta = event.get("delta")
-                if delta:
-                    parts = self.openai_audio_fallback_parts.setdefault(response_id, [])
-                    if len(parts) < 500:
-                        parts.append(str(delta))
                 if self.response_first_audio_at is None:
                     self.response_first_audio_at = monotonic()
                 if self.openai_audio_delta_count == 1:
-                    log.info(
-                        "openai_audio_delta_ignored_for_cartesia",
+                    log.error(
+                        "openai_audio_delta_unexpected_in_cartesia_mode",
                         response_id=response_id,
                         output_format=self.openai_output_audio_format,
+                        action="ignored_never_play_openai_audio",
                     )
                 return
             if self.openai_audio_delta_count == 1 or self.openai_audio_delta_count % 50 == 0:
@@ -588,11 +685,22 @@ class TwilioMediaSession:
         if event_type in {"response.audio_transcript.done", "response.output_audio_transcript.done"}:
             response_id = event.get("response_id") or "active"
             transcript = event.get("transcript") or "".join(self.assistant_transcript_parts.pop(response_id, []))
-            if self._add_transcript_turn("assistant", transcript):
-                self._spawn(self._record_assistant_question(transcript), "assistant_question_recorder")
-                self._spawn(self._record_assistant_metrics(transcript), "assistant_metrics_recorder")
-                if self._using_cartesia_tts():
-                    self._spawn(self._speak_with_cartesia(transcript, response_id), "cartesia_tts_playback")
+            self._handle_assistant_text_completed(response_id, transcript, source=event_type)
+            return
+        if event_type in {"response.text.delta", "response.output_text.delta"}:
+            response_id = event.get("response_id") or self.current_response_id or "active"
+            delta = event.get("delta")
+            if delta:
+                self.assistant_transcript_parts.setdefault(response_id, []).append(str(delta))
+            return
+        if event_type in {"response.text.done", "response.output_text.done"}:
+            response_id = event.get("response_id") or self.current_response_id or "active"
+            transcript = (
+                event.get("text")
+                or event.get("transcript")
+                or "".join(self.assistant_transcript_parts.pop(response_id, []))
+            )
+            self._handle_assistant_text_completed(response_id, transcript, source=event_type)
             return
         if event_type in {"response.audio.done", "response.output_audio.done"}:
             response_id = event.get("response_id") or self.current_response_id or "openai-response"
@@ -617,6 +725,10 @@ class TwilioMediaSession:
             return
         if event_type == "response.done":
             response_id = event.get("response_id") or (event.get("response") or {}).get("id")
+            if self._using_cartesia_tts() and response_id and response_id not in self.cartesia_spoken_response_ids:
+                response_text = self._extract_text_from_response_event(event.get("response") or event)
+                if response_text:
+                    self._handle_assistant_text_completed(response_id, response_text, source=event_type)
             log.info(
                 "response_done",
                 response_id=response_id,
@@ -624,8 +736,6 @@ class TwilioMediaSession:
                 audio_delta_count=self.openai_audio_delta_count,
             )
             self._handle_response_completed(event)
-            if self._using_cartesia_tts() and response_id:
-                self._spawn(self._delayed_cartesia_fallback(response_id), "cartesia_delayed_fallback")
             return
         if event_type == "error":
             log.warning("openai_realtime_error", error=event.get("error"), active_voice=self.active_realtime_voice)
@@ -713,6 +823,7 @@ class TwilioMediaSession:
             output_format=self.openai_output_audio_format,
             output_rate=self.openai_output_audio_rate,
             twilio_passthrough=self.openai_output_audio_format == "audio/pcmu",
+            cartesia_text_only=self._using_cartesia_tts() and self.openai_output_audio_format is None,
             transcoding_to_twilio=False,
         )
         if self.openai_output_audio_format and self.openai_output_audio_format != "audio/pcmu":
@@ -754,6 +865,58 @@ class TwilioMediaSession:
 
         return [payload]
 
+    def _extract_text_from_response_event(self, event: dict) -> str:
+        candidates: list[str] = []
+        for key in ("text", "transcript", "delta"):
+            value = event.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value)
+        part = event.get("part") or {}
+        if isinstance(part, dict):
+            for key in ("text", "transcript"):
+                value = part.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidates.append(value)
+        item = event.get("item") or {}
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(content, list):
+            for entry in content:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("text", "transcript"):
+                    value = entry.get(key)
+                    if isinstance(value, str) and value.strip():
+                        candidates.append(value)
+        output = event.get("output") if isinstance(event, dict) else None
+        if isinstance(output, list):
+            for output_item in output:
+                if not isinstance(output_item, dict):
+                    continue
+                for entry in output_item.get("content") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    for key in ("text", "transcript"):
+                        value = entry.get(key)
+                        if isinstance(value, str) and value.strip():
+                            candidates.append(value)
+        return " ".join(" ".join(candidates).split())
+
+    def _handle_assistant_text_completed(self, response_id: str, transcript: str | None, *, source: str) -> None:
+        cleaned = " ".join(str(transcript or "").split())
+        if not cleaned:
+            log.info("assistant_text_empty", response_id=response_id, source=source)
+            return
+        if self._using_cartesia_tts() and response_id in self.cartesia_spoken_response_ids:
+            log.info("assistant_text_duplicate_ignored", response_id=response_id, source=source)
+            return
+        if self._add_transcript_turn("assistant", cleaned):
+            self._spawn(self._record_assistant_question(cleaned), "assistant_question_recorder")
+            self._spawn(self._record_assistant_metrics(cleaned), "assistant_metrics_recorder")
+            if self._using_cartesia_tts():
+                self.cartesia_spoken_response_ids.add(response_id)
+                log.info("cartesia_playback_requested", response_id=response_id, source=source, chars=len(cleaned))
+                self._spawn(self._speak_with_cartesia(cleaned, response_id), "cartesia_tts_playback")
+
     def _using_cartesia_tts(self) -> bool:
         return getattr(self, "cartesia_tts", None) is not None
 
@@ -763,6 +926,11 @@ class TwilioMediaSession:
             return
         if reason == "greeting":
             self.greeting_response_id = response_id
+            self.greeting_manager.start(response_id)
+            self.greeting_clear_locked_until = float("inf")
+            log.info("greeting_started", mode="cartesia", response_id=response_id)
+        playback_generation = self.response_manager.begin_playback(response_id)
+        self.cartesia_tts_active.add(response_id)
         self._add_transcript_turn("assistant", cleaned)
         started = monotonic()
         log.info("cartesia_fixed_tts_started", reason=reason, response_id=response_id, chars=len(cleaned))
@@ -771,12 +939,15 @@ class TwilioMediaSession:
         except Exception as exc:
             log.exception("cartesia_fixed_tts_failed", reason=reason, response_id=response_id, error=str(exc))
             self.metrics.inc("cartesia_tts_failure_total")
+            self.cartesia_tts_active.discard(response_id)
             if reason == "greeting":
-                await self._request_assistant_response(
-                    self._build_greeting_instructions(),
-                    reason="greeting_fallback",
-                    force=True,
-                )
+                self.greeting_completed = True
+                self.greeting_manager.complete(response_id)
+                self.greeting_clear_locked_until = 0.0
+            return
+        if not self.response_manager.is_current(playback_generation, response_id):
+            self.cartesia_tts_active.discard(response_id)
+            log.info("cartesia_fixed_tts_discarded", reason=reason, response_id=response_id, discard_reason="stale_generation")
             return
         self.metrics.inc("cartesia_tts_success_total")
         log.info(
@@ -786,7 +957,10 @@ class TwilioMediaSession:
             latency_ms=self._elapsed_ms(started, monotonic()),
             audio_bytes=len(ulaw_audio),
         )
-        await self._send_twilio_ulaw_audio(ulaw_audio, response_id=response_id)
+        try:
+            await self._send_twilio_ulaw_audio(ulaw_audio, response_id=response_id)
+        finally:
+            self.cartesia_tts_active.discard(response_id)
 
     async def _speak_with_cartesia(self, transcript: str | None, response_id: str | None) -> None:
         text = " ".join(str(transcript or "").split())
@@ -797,6 +971,7 @@ class TwilioMediaSession:
             return
         playback_id = response_id or self.current_response_id or "cartesia-response"
         self.cartesia_tts_active.add(playback_id)
+        playback_generation = self.response_manager.begin_playback(playback_id)
         self._set_assistant_speaking(True, "cartesia_tts_started")
         self._safe_transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_tts_started")
         started = monotonic()
@@ -807,7 +982,11 @@ class TwilioMediaSession:
             self._set_assistant_speaking(False, "cartesia_tts_failed")
             log.exception("cartesia_tts_playback_failed", response_id=response_id, error=str(exc))
             self.metrics.inc("cartesia_tts_failure_total")
-            await self._play_openai_audio_fallback(response_id)
+            return
+        if not self.response_manager.is_current(playback_generation, playback_id):
+            self.cartesia_tts_active.discard(playback_id)
+            self._set_assistant_speaking(False, "cartesia_stale_generation")
+            log.info("cartesia_tts_discarded", response_id=response_id, reason="stale_generation")
             return
         self.metrics.inc("cartesia_tts_success_total")
         log.info(
@@ -822,7 +1001,6 @@ class TwilioMediaSession:
             self._set_assistant_speaking(False, "cartesia_audio_send_failed")
             log.exception("cartesia_audio_send_failed", response_id=playback_id, error=str(exc))
             self.metrics.inc("cartesia_tts_failure_total")
-            await self._play_openai_audio_fallback(playback_id)
             return
         finally:
             self.cartesia_tts_active.discard(playback_id)
@@ -843,6 +1021,14 @@ class TwilioMediaSession:
         sent_count = 0
         chunk_size = 160
         for index in range(0, len(audio), chunk_size):
+            if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING or self.stopping:
+                log.info(
+                    "cartesia_audio_enqueue_stopped",
+                    response_id=response_id,
+                    reason="caller_speaking_or_stopping",
+                    chunks_sent=sent_count,
+                )
+                break
             chunk = audio[index : index + chunk_size]
             payload = base64.b64encode(chunk).decode("ascii")
             if sent_count == 0:
@@ -859,6 +1045,11 @@ class TwilioMediaSession:
                     response_create_to_first_audio_ms=self._elapsed_ms(self.response_create_sent_at, self.response_first_audio_at),
                     call_to_first_audio_ms=self._elapsed_ms(self.call_started_at, self.response_first_audio_at),
                 )
+                log.info(
+                    "cartesia_first_audio",
+                    response_id=response_id,
+                    first_audio_latency_ms=self._elapsed_ms(self.response_create_sent_at, self.response_first_audio_at),
+                )
             if self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": payload}}, "audio"):
                 sent_count += 1
         if sent_count == 0:
@@ -869,8 +1060,9 @@ class TwilioMediaSession:
         for _ in range(sent_count):
             self.metrics.inc("voice_twilio_media_sent_total")
         log.info(
-            "cartesia_audio_enqueued",
+            "twilio_audio_sent",
             response_id=response_id,
+            source="cartesia",
             chunks=sent_count,
             audio_bytes=len(audio),
             chunk_size=chunk_size,
@@ -879,6 +1071,14 @@ class TwilioMediaSession:
         return sent_count
 
     async def _play_openai_audio_fallback(self, response_id: str | None) -> None:
+        if self._using_cartesia_tts():
+            log.error(
+                "openai_audio_fallback_disabled_for_cartesia",
+                response_id=response_id or self.current_response_id or "active",
+            )
+            if not self.pending_marks:
+                self._set_assistant_speaking(False, "openai_audio_fallback_disabled")
+            return
         fallback_id = response_id or self.current_response_id or "active"
         parts = self.openai_audio_fallback_parts.pop(fallback_id, [])
         if not parts:
@@ -898,6 +1098,9 @@ class TwilioMediaSession:
             self._set_assistant_speaking(False, "openai_audio_fallback_not_sent")
 
     async def _delayed_cartesia_fallback(self, response_id: str) -> None:
+        if self._using_cartesia_tts():
+            log.error("cartesia_openai_audio_fallback_disabled", response_id=response_id)
+            return
         await asyncio.sleep(0.4)
         if (
             response_id in self.cartesia_playback_started
@@ -931,15 +1134,39 @@ class TwilioMediaSession:
         await self.openai_ws.send(json.dumps(event))
 
     async def _send_session_update(self, session_instructions: str, *, reason: str) -> None:
+        cartesia_mode = self._using_cartesia_tts()
+        output_modalities = ["text"] if cartesia_mode else ["audio"]
+        audio_config: dict[str, Any] = {
+            "input": {
+                "format": {"type": "audio/pcmu"},
+                "transcription": {"model": self.settings.openai_transcription_model},
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.80,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 800,
+                    "idle_timeout_ms": 6000,
+                    "interrupt_response": False,
+                    "create_response": False,
+                },
+            },
+        }
+        if not cartesia_mode:
+            audio_config["output"] = {
+                "format": {"type": "audio/pcmu"},
+                "voice": self.active_realtime_voice,
+            }
         log.info(
             "session_update_config",
             reason=reason,
             model=self.settings.openai_realtime_model,
-            voice=self.active_realtime_voice,
-            speed=self.settings.openai_realtime_speed,
+            voice=None if cartesia_mode else self.active_realtime_voice,
+            speed=None if cartesia_mode else self.settings.openai_realtime_speed,
             input_format="audio/pcmu",
-            output_format="audio/pcmu",
+            output_format="text_only_cartesia" if cartesia_mode else "audio/pcmu",
+            output_modalities=output_modalities,
             transcription_model=self.settings.openai_transcription_model,
+            cartesia_enabled=cartesia_mode,
         )
         await self._send_openai(
             {
@@ -947,31 +1174,15 @@ class TwilioMediaSession:
                 "session": {
                     "type": "realtime",
                     "instructions": session_instructions,
-                    "output_modalities": ["audio"],
-                    "audio": {
-                        "input": {
-                            "format": {"type": "audio/pcmu"},
-                            "transcription": {"model": self.settings.openai_transcription_model},
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.80,           # was 0.5 — too sensitive, AI heard its own echo and self-interrupted
-                                "prefix_padding_ms": 300,    # was 450 — genuine speech now detected faster
-                                "silence_duration_ms": 800,  # was 500 — gives user time to finish sentence without mid-cut
-                                "idle_timeout_ms": 6000,
-                                "interrupt_response": False,
-                                "create_response": False,
-                            },
-                        },
-                        "output": {
-                            "format": {"type": "audio/pcmu"},
-                            "voice": self.active_realtime_voice,
-                        },
-                    },
+                    "output_modalities": output_modalities,
+                    "audio": audio_config,
                 },
             }
         )
 
     async def _maybe_fallback_realtime_voice(self, event: dict) -> None:
+        if self._using_cartesia_tts():
+            return
         if self.voice_fallback_applied or self.active_realtime_voice == "coral":
             return
         error_text = json.dumps(event.get("error") or event, default=str).lower()
@@ -1034,6 +1245,7 @@ class TwilioMediaSession:
             return False
         log.info("response_gate_passed", reason=reason)
         log.info("response_create_instructions_preview", reason=reason, chars=len(instructions), preview=_preview(instructions))
+        self.pending_response_create_reason = reason
         await self._send_openai({"type": "response.create", "response": {"instructions": instructions}})
         self.response_create_sent_at = monotonic()
         if reason == "greeting":
@@ -1085,11 +1297,16 @@ class TwilioMediaSession:
             await self._handle_user_transcript_locked(transcript)
 
     async def _handle_user_transcript_locked(self, transcript: str | None) -> None:
-        if not self.state or not self._add_transcript_turn("user", transcript):
+        text = str(transcript or "")
+        if not self.state:
+            return
+        if self._greeting_locked():
+            log.info("user_transcript_ignored_during_greeting", chars=len(text))
+            return
+        if not self._add_transcript_turn("user", transcript):
             return
         self.silence_prompt_count = 0
         self._transition(CallPhase.PROCESSING_USER, "user_transcript_completed")
-        text = str(transcript or "")
         updates = extract_customer_facts(text, self.customer_memory)
         updates.update(detect_language_update(text, self.customer_memory))
         profile_result = classify_customer_profile_with_confidence(text, self.customer_memory)
@@ -1289,6 +1506,12 @@ class TwilioMediaSession:
             return "Haan ji, main Riya bol rahi hoon DreamHome se. Property enquiry ke baare mein call kiya tha."
         return OUTGOING_CONFIRM_LINE.format(customer_name=customer_name)
 
+    def _greeting_has_customer_name(self) -> bool:
+        return bool(
+            str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
+            or getattr(self.claims, "customer_name", None)
+        )
+
     def _build_greeting_instructions(self) -> str:
         confirm_line = self._greeting_text()
         instructions = (
@@ -1306,22 +1529,28 @@ class TwilioMediaSession:
 
     def _handle_response_started(self, event: dict) -> None:
         response_id = (event.get("response") or {}).get("id") or event.get("response_id")
+        reason = self.pending_response_create_reason
+        self.pending_response_create_reason = None
         if self.assistant_response_active and response_id != self.current_response_id:
             log.info("response_started_while_active", current_response_id=self.current_response_id, new_response_id=response_id)
         self.assistant_response_active = True
         self.current_response_id = response_id
+        self.response_manager.begin_response(response_id)
         self.response_started_at = monotonic()
         self.response_completed_at = None
         self.response_first_audio_at = None
-        if self.greeting_response_id is None:
+        if reason == "greeting":
             self.greeting_response_id = response_id
-        log.info("assistant_response_started", response_id=response_id)
+            self.greeting_manager.start(response_id or "openai-greeting")
+            self.greeting_clear_locked_until = float("inf")
+        log.info("assistant_response_started", response_id=response_id, reason=reason)
         self._spawn(self._response_audio_watchdog(response_id), "response_audio_watchdog")
 
     def _handle_response_completed(self, event: dict) -> None:
         response_id = (event.get("response") or {}).get("id") or self.current_response_id
         self.response_completed_at = monotonic()
         self.assistant_response_active = False
+        self.response_manager.begin_response(None)
         if response_id == self.current_response_id:
             self.current_response_id = None
         response_ms = self._elapsed_ms(self.response_started_at, self.response_completed_at)
@@ -1350,7 +1579,16 @@ class TwilioMediaSession:
                     self._safe_transition(CallPhase.WAITING_FOR_USER, "twilio_mark_ack")
             if response_id == self.greeting_response_id and not self.greeting_completed:
                 self.greeting_completed = True
-                log.info("greeting_finished", response_id=response_id)
+                self.greeting_manager.complete(response_id)
+                self.greeting_clear_locked_until = 0.0
+                log.info(
+                    "greeting_completed",
+                    response_id=response_id,
+                    greeting_latency_ms=self._elapsed_ms(self.call_started_at, self.greeting_manager.started_at),
+                    greeting_playback_ms=self._elapsed_ms(self.greeting_manager.started_at, self.greeting_manager.completed_at),
+                )
+            if response_id:
+                log.info("cartesia_playback_completed", response_id=response_id, pending_marks=len(self.pending_marks))
             log.info("twilio_mark_ack", mark_name=mark_name, pending_marks=len(self.pending_marks), assistant_speaking=self.assistant_speaking)
             if (
                 not self.pending_marks
@@ -1377,13 +1615,18 @@ class TwilioMediaSession:
             log.info("barge_in_ignored_no_assistant_audio", speech_ms=round(speech_seconds * 1000, 2))
             return
         log.info("barge_in_confirmed", speech_ms=round(speech_seconds * 1000, 2), response_id=self.current_response_id)
+        log.info("user_interruption", speech_ms=round(speech_seconds * 1000, 2), response_id=self.current_response_id)
         await self._clear_twilio_buffer()
         await self._cancel_current_openai_response("barge_in")
-        self.openai_audio_fallback_parts.clear()
-        self.cartesia_tts_active.clear()
 
     async def _cancel_current_openai_response(self, reason: str) -> None:
-        if not self.assistant_response_active and not self.assistant_speaking and self.current_response_id is None:
+        if (
+            not self.assistant_response_active
+            and not self.assistant_speaking
+            and self.current_response_id is None
+            and not getattr(self, "pending_marks", set())
+            and not getattr(self, "cartesia_tts_active", set())
+        ):
             log.info("assistant_response_cancel_ignored", reason=reason)
             return
         if self.openai_ws and self.assistant_response_active:
@@ -1392,8 +1635,25 @@ class TwilioMediaSession:
         self.assistant_response_active = False
         self._set_assistant_speaking(False, reason)
         self.current_response_id = None
+        if hasattr(self, "response_manager"):
+            self.response_manager.cancel(reason)
+        cancelled_marks = len(getattr(self, "pending_marks", set()))
+        cancelled_tts = len(getattr(self, "cartesia_tts_active", set()))
+        if hasattr(self, "pending_marks"):
+            self.pending_marks.clear()
+        if hasattr(self, "mark_response_ids"):
+            self.mark_response_ids.clear()
+        if hasattr(self, "cartesia_tts_active"):
+            self.cartesia_tts_active.clear()
+        if hasattr(self, "openai_audio_fallback_parts"):
+            self.openai_audio_fallback_parts.clear()
         self.response_completed_at = monotonic()
-        log.info("assistant_response_cancelled", reason=reason)
+        log.info(
+            "assistant_response_cancelled",
+            reason=reason,
+            cancelled_marks=cancelled_marks,
+            cancelled_tts=cancelled_tts,
+        )
 
     async def _twilio_sender_loop(self) -> None:
         while not self.stopping:
@@ -1465,11 +1725,17 @@ class TwilioMediaSession:
         log.info("assistant_state_changed", field="assistant_speaking", value=value, reason=reason)
 
     async def _response_audio_watchdog(self, response_id: str | None) -> None:
-        await asyncio.sleep(RESPONSE_AUDIO_TIMEOUT_SECONDS)
+        timeout_seconds = CARTESIA_RESPONSE_TIMEOUT_SECONDS if self._using_cartesia_tts() else RESPONSE_AUDIO_TIMEOUT_SECONDS
+        await asyncio.sleep(timeout_seconds)
         if self.stopping or response_id != self.current_response_id or self.response_first_audio_at:
             return
-        log.warning("fallback_triggered", reason="response_audio_timeout", response_id=response_id)
+        if self._using_cartesia_tts() and self.cartesia_tts_active:
+            return
+        log.warning("fallback_triggered", reason="response_audio_timeout", response_id=response_id, timeout_seconds=timeout_seconds)
         await self._cancel_current_openai_response("response_audio_timeout")
+        if self._using_cartesia_tts():
+            await self._speak_fixed_text("Ji sir, ek second.", response_id="cartesia-response-timeout", reason="response_audio_timeout")
+            return
         await self._request_assistant_response("Ji sir, ek second.", reason="response_audio_timeout", force=True)
 
     async def _silence_watchdog(self) -> None:
@@ -1503,7 +1769,12 @@ class TwilioMediaSession:
         await self._stop()
 
     def _greeting_locked(self) -> bool:
-        return not self.greeting_completed and monotonic() < self.greeting_clear_locked_until
+        manager = getattr(self, "greeting_manager", None)
+        manager_playing = bool(manager and manager.is_playing)
+        return manager_playing or (
+            not getattr(self, "greeting_completed", False)
+            and monotonic() < getattr(self, "greeting_clear_locked_until", 0.0)
+        )
 
     async def _stop(self, failure_reason: str | None = None) -> None:
         if self.stopping:

@@ -28,25 +28,33 @@ settings = get_settings()
 configure_logging(settings.log_level)
 
 
+def _active_tts_provider(settings) -> str:
+    if settings.voice_pipeline == "text_streaming":
+        return "cartesia_streaming"
+    return "cartesia" if settings.tts_provider == "cartesia" else "openai_realtime"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.validate_startup()
     text_streaming_active = settings.voice_pipeline == "text_streaming"
+    active_tts_provider = _active_tts_provider(settings)
+    cartesia_active = settings.tts_provider == "cartesia" or text_streaming_active
     log.info(
         "voice_pipeline_config",
         active_voice_pipeline=settings.voice_pipeline,
         active_stt_provider="deepgram" if text_streaming_active else "openai_realtime",
         active_llm_provider="openai_text" if text_streaming_active else "openai_realtime",
-        active_tts_provider="cartesia_streaming" if text_streaming_active else "openai_realtime",
+        active_tts_provider=active_tts_provider,
         openai_realtime_model=settings.openai_realtime_model,
         openai_realtime_voice=settings.openai_realtime_voice,
         openai_realtime_speed=settings.openai_realtime_speed,
         openai_text_model=settings.openai_text_model,
-        cartesia_enabled=bool(text_streaming_active and settings.cartesia_api_key and settings.cartesia_voice_id),
-        cartesia_model=settings.cartesia_model_id if text_streaming_active else None,
-        cartesia_voice_id_suffix=settings.cartesia_voice_id[-6:] if text_streaming_active and settings.cartesia_voice_id else None,
-        cartesia_sample_rate=settings.cartesia_sample_rate if text_streaming_active else None,
-        cartesia_encoding=settings.cartesia_encoding if text_streaming_active else None,
+        cartesia_enabled=bool(cartesia_active and settings.cartesia_api_key and settings.cartesia_voice_id),
+        cartesia_model=settings.cartesia_model_id if cartesia_active else None,
+        cartesia_voice_id_suffix=settings.cartesia_voice_id[-6:] if cartesia_active and settings.cartesia_voice_id else None,
+        cartesia_sample_rate=settings.cartesia_sample_rate if cartesia_active else None,
+        cartesia_encoding=settings.cartesia_encoding if cartesia_active else None,
         deepgram_enabled=bool(text_streaming_active and settings.deepgram_api_key),
         deepgram_model=settings.deepgram_model if text_streaming_active else None,
         deepgram_language=settings.deepgram_language if text_streaming_active else None,
@@ -129,7 +137,7 @@ async def _twilio_media_authenticated(websocket: WebSocket, stream_token: str | 
         active_voice_pipeline=settings.voice_pipeline,
         active_stt_provider="deepgram" if settings.voice_pipeline == "text_streaming" else "openai_realtime",
         active_llm_provider="openai_text" if settings.voice_pipeline == "text_streaming" else "openai_realtime",
-        active_tts_provider="cartesia_streaming" if settings.voice_pipeline == "text_streaming" else "openai_realtime",
+        active_tts_provider=_active_tts_provider(settings),
         session_class=session_cls.__name__,
     )
     session = session_cls(
