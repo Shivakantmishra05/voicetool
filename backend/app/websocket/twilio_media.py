@@ -29,14 +29,17 @@ from app.conversation.stage_manager import determine_stage_with_reason, get_stag
 from app.database.session import SessionLocal
 from app.models import Call
 from app.prompts.real_estate_agent import (
+    CLOSING_OPTIONS,
     SYSTEM_PROMPT,
-    OUTGOING_CONFIRM_LINE,
-    OUTGOING_INTRO_LINE,
+    OUTGOING_CONFIRM_OPTIONS,
+    OUTGOING_INTRO_OPTIONS,
     build_dynamic_response_context,
+    choose_conversation_variant,
 )
 from app.observability import Metrics
 from app.services.call_repository import CallRepository
 from app.services.call_summary import CallSummarizer
+from app.services.cartesia_streaming_tts import CartesiaStreamingTTS
 from app.services.cartesia_tts import CartesiaTTS
 from app.services.crm_outbox import CRMOutbox
 from app.services.memory import ConversationMemory, ConversationState
@@ -110,8 +113,7 @@ AI_IDENTITY_TERMS = (
     "ai ho",
     "ai lag",
     "artificial intelligence",
-    "robot",
-    "bot",
+    "robot hai",
     "एआई",
     "ए आई",
     "AI बोल",
@@ -254,6 +256,7 @@ class TwilioMediaSession:
         self.crm_outbox = crm_outbox
         self.call_memory = CallMemoryManager(memory.redis)
         self.cartesia_tts = CartesiaTTS(settings) if settings.tts_provider == "cartesia" else None
+        self.cartesia_streaming_tts = CartesiaStreamingTTS(settings) if settings.tts_provider == "cartesia" else None
 
         self.state: ConversationState | None = None
         self.call: Call | None = None
@@ -263,8 +266,12 @@ class TwilioMediaSession:
         self.stopping = False
         self.transcript_turns: list[dict[str, str]] = []
         self.assistant_transcript_parts: dict[str, list[str]] = {}
+        self.assistant_stream_spoken_chars: dict[str, int] = {}
+        self.assistant_stream_first_sent: set[str] = set()
+        self.assistant_first_token_logged: set[str] = set()
         self.openai_audio_fallback_parts: dict[str, list[str]] = {}
         self.cartesia_tts_active: set[str] = set()
+        self.cartesia_stream_contexts: dict[str, str] = {}
         self.cartesia_playback_started: set[str] = set()
         self.cartesia_spoken_response_ids: set[str] = set()
         self.greeting_manager = GreetingManager()
@@ -399,8 +406,22 @@ class TwilioMediaSession:
                 voice_id_suffix=self.settings.cartesia_voice_id[-6:] if self.settings.cartesia_voice_id else None,
                 sample_rate=self.settings.cartesia_sample_rate,
                 encoding=self.settings.cartesia_encoding,
+                streaming_enabled=self.cartesia_streaming_tts is not None,
             )
-        self.openai_connect_task = self._spawn(self._connect_openai(request_greeting=True), "openai_realtime_connector")
+        cartesia_greeting_started = False
+        if self._using_cartesia_tts():
+            greeting_text = self._greeting_text()
+            if not self._greeting_has_customer_name():
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {"intro_delivered": True, "conversation_stage": "INTRO"},
+                )
+            self._spawn(self._speak_fixed_text(greeting_text, response_id="cartesia-greeting", reason="greeting"), "cartesia_greeting")
+            cartesia_greeting_started = True
+        self.openai_connect_task = self._spawn(
+            self._connect_openai(request_greeting=not cartesia_greeting_started),
+            "openai_realtime_connector",
+        )
         self._spawn(self._silence_watchdog(), "silence_watchdog")
 
     async def _connect_openai(self, *, request_greeting: bool) -> None:
@@ -611,6 +632,7 @@ class TwilioMediaSession:
             return
         if event_type == "input_audio_buffer.speech_started":
             self.last_activity_at = monotonic()
+            log.debug("customer_speech_started", phase=self.phase.value)
             if self._greeting_locked():
                 log.info("interruption_ignored_during_greeting")
                 return
@@ -629,6 +651,7 @@ class TwilioMediaSession:
             self.last_activity_at = monotonic()
             self.caller_speaking = False
             self.caller_speech_started_at = None
+            log.debug("customer_speech_finished", phase=self.phase.value)
             log.info("openai_speech_stopped")
             if not self.assistant_response_active and not self.assistant_speaking and not self.pending_marks:
                 await self._flush_deferred_response()
@@ -691,7 +714,16 @@ class TwilioMediaSession:
             response_id = event.get("response_id") or self.current_response_id or "active"
             delta = event.get("delta")
             if delta:
+                if response_id not in self.assistant_first_token_logged:
+                    self.assistant_first_token_logged.add(response_id)
+                    log.debug(
+                        "llm_first_token",
+                        response_id=response_id,
+                        response_create_to_first_token_ms=self._elapsed_ms(self.response_create_sent_at, monotonic()),
+                    )
                 self.assistant_transcript_parts.setdefault(response_id, []).append(str(delta))
+                if self._using_cartesia_tts():
+                    self._maybe_stream_first_text_fragment(response_id)
             return
         if event_type in {"response.text.done", "response.output_text.done"}:
             response_id = event.get("response_id") or self.current_response_id or "active"
@@ -906,7 +938,8 @@ class TwilioMediaSession:
         if not cleaned:
             log.info("assistant_text_empty", response_id=response_id, source=source)
             return
-        if self._using_cartesia_tts() and response_id in self.cartesia_spoken_response_ids:
+        spoken_chars = self.assistant_stream_spoken_chars.get(response_id, 0)
+        if self._using_cartesia_tts() and response_id in self.cartesia_spoken_response_ids and not spoken_chars:
             log.info("assistant_text_duplicate_ignored", response_id=response_id, source=source)
             return
         if self._add_transcript_turn("assistant", cleaned):
@@ -914,8 +947,79 @@ class TwilioMediaSession:
             self._spawn(self._record_assistant_metrics(cleaned), "assistant_metrics_recorder")
             if self._using_cartesia_tts():
                 self.cartesia_spoken_response_ids.add(response_id)
-                log.info("cartesia_playback_requested", response_id=response_id, source=source, chars=len(cleaned))
-                self._spawn(self._speak_with_cartesia(cleaned, response_id), "cartesia_tts_playback")
+                remaining = cleaned[spoken_chars:].strip() if spoken_chars else cleaned
+                self.assistant_stream_spoken_chars.pop(response_id, None)
+                self.assistant_stream_first_sent.discard(response_id)
+                self.assistant_first_token_logged.discard(response_id)
+                self.assistant_transcript_parts.pop(response_id, None)
+                if remaining:
+                    playback_id = response_id if not spoken_chars else f"{response_id}-final"
+                    log.info(
+                        "cartesia_playback_requested",
+                        response_id=playback_id,
+                        source=source,
+                        chars=len(remaining),
+                        already_streamed_chars=spoken_chars,
+                    )
+                    if spoken_chars:
+                        self._spawn(
+                            self._speak_with_cartesia_after_playback(
+                                remaining,
+                                playback_id,
+                                previous_playback_id=f"{response_id}-first",
+                            ),
+                            "cartesia_tts_playback_after_first_fragment",
+                        )
+                    else:
+                        self._spawn(self._speak_with_cartesia(remaining, playback_id), "cartesia_tts_playback")
+                else:
+                    log.info("assistant_text_remaining_empty_after_stream", response_id=response_id, source=source)
+
+    def _maybe_stream_first_text_fragment(self, response_id: str) -> None:
+        if response_id in self.assistant_stream_first_sent or response_id in self.cartesia_spoken_response_ids:
+            return
+        if self.caller_speaking or self.phase == CallPhase.USER_SPEAKING or self.stopping:
+            return
+        buffer = " ".join("".join(self.assistant_transcript_parts.get(response_id, [])).split())
+        if not buffer:
+            return
+        fragment = _first_streamable_fragment(buffer)
+        if not fragment:
+            return
+        self.assistant_stream_first_sent.add(response_id)
+        self.assistant_stream_spoken_chars[response_id] = len(fragment)
+        playback_id = f"{response_id}-first"
+        log.debug(
+            "first_complete_sentence",
+            response_id=response_id,
+            playback_id=playback_id,
+            chars=len(fragment),
+        )
+        log.info("cartesia_playback_requested", response_id=playback_id, source="response.text.delta", chars=len(fragment), streamed_fragment=True)
+        self._spawn(self._speak_with_cartesia(fragment, playback_id), "cartesia_tts_first_fragment")
+
+    async def _speak_with_cartesia_after_playback(
+        self,
+        text: str,
+        response_id: str,
+        *,
+        previous_playback_id: str,
+    ) -> None:
+        deadline = monotonic() + 8.0
+        while not self.stopping and monotonic() < deadline:
+            previous_active = previous_playback_id in self.cartesia_tts_active
+            previous_pending_mark = previous_playback_id in self.mark_response_ids.values()
+            if not previous_active and not previous_pending_mark:
+                break
+            await asyncio.sleep(0.05)
+        if self.stopping:
+            return
+        log.debug(
+            "cartesia_followup_playback_released",
+            response_id=response_id,
+            previous_playback_id=previous_playback_id,
+        )
+        await self._speak_with_cartesia(text, response_id)
 
     def _using_cartesia_tts(self) -> bool:
         return getattr(self, "cartesia_tts", None) is not None
@@ -933,7 +1037,26 @@ class TwilioMediaSession:
         self.cartesia_tts_active.add(response_id)
         self._add_transcript_turn("assistant", cleaned)
         started = monotonic()
-        log.info("cartesia_fixed_tts_started", reason=reason, response_id=response_id, chars=len(cleaned))
+        log.info("cartesia_fixed_tts_started", reason=reason, response_id=response_id, chars=len(cleaned), streaming=True)
+        sent_count = 0
+        try:
+            sent_count = await self._stream_cartesia_to_twilio(
+                cleaned,
+                response_id=response_id,
+                playback_generation=playback_generation,
+                reason=reason,
+            )
+        except Exception as exc:
+            log.exception("cartesia_fixed_stream_failed", reason=reason, response_id=response_id, error=str(exc))
+            self.metrics.inc("cartesia_tts_failure_total")
+        if sent_count:
+            self.cartesia_tts_active.discard(response_id)
+            return
+        if self.stopping or not self.response_manager.is_current(playback_generation, response_id):
+            self.cartesia_tts_active.discard(response_id)
+            log.info("cartesia_fixed_tts_discarded", reason=reason, response_id=response_id, discard_reason="stale_generation_after_stream")
+            return
+        log.warning("cartesia_stream_zero_audio_using_rest_fallback", reason=reason, response_id=response_id)
         try:
             ulaw_audio = await self.cartesia_tts.synthesize_ulaw(cleaned, call_sid=self.state.call_sid)
         except Exception as exc:
@@ -975,6 +1098,28 @@ class TwilioMediaSession:
         self._set_assistant_speaking(True, "cartesia_tts_started")
         self._safe_transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_tts_started")
         started = monotonic()
+        sent_count = 0
+        try:
+            sent_count = await self._stream_cartesia_to_twilio(
+                text,
+                response_id=playback_id,
+                playback_generation=playback_generation,
+                reason="assistant_response",
+            )
+        except Exception as exc:
+            log.exception("cartesia_stream_playback_failed", response_id=response_id, error=str(exc))
+            self.metrics.inc("cartesia_tts_failure_total")
+        if sent_count:
+            self.cartesia_tts_active.discard(playback_id)
+            self.cartesia_playback_started.add(playback_id)
+            self.openai_audio_fallback_parts.pop(playback_id, None)
+            return
+        if self.stopping or not self.response_manager.is_current(playback_generation, playback_id):
+            self.cartesia_tts_active.discard(playback_id)
+            self._set_assistant_speaking(False, "cartesia_stale_generation")
+            log.info("cartesia_tts_discarded", response_id=response_id, reason="stale_generation_after_stream")
+            return
+        log.warning("cartesia_stream_zero_audio_using_rest_fallback", response_id=response_id)
         try:
             ulaw_audio = await self.cartesia_tts.synthesize_ulaw(text, call_sid=self.state.call_sid)
         except Exception as exc:
@@ -1011,6 +1156,84 @@ class TwilioMediaSession:
             log.warning("cartesia_audio_not_sent", response_id=playback_id, caller_speaking=self.caller_speaking, phase=self.phase.value)
             if not self.pending_marks:
                 self._set_assistant_speaking(False, "cartesia_audio_not_sent")
+
+    async def _stream_cartesia_to_twilio(
+        self,
+        text: str,
+        *,
+        response_id: str,
+        playback_generation: int,
+        reason: str,
+    ) -> int:
+        if not self.cartesia_streaming_tts or not self.state or not self.state.stream_sid:
+            return 0
+        sent_count = 0
+        audio_bytes = 0
+        first_audio_at: float | None = None
+        aborted = False
+        protected_greeting = response_id == self.greeting_response_id or reason == "greeting"
+        log.info("cartesia_stream_playback_started", reason=reason, response_id=response_id, chars=len(text))
+        async for context_id, payload in self.cartesia_streaming_tts.stream_ulaw_payloads(text, call_sid=self.state.call_sid):
+            self.cartesia_stream_contexts[response_id] = context_id
+            if not self.response_manager.is_current(playback_generation, response_id):
+                aborted = True
+                with contextlib.suppress(Exception):
+                    await self.cartesia_streaming_tts.cancel(context_id)
+                log.info("cartesia_stream_playback_cancelled", response_id=response_id, reason="stale_generation", chunks_sent=sent_count)
+                break
+            if not protected_greeting and (self.caller_speaking or self.phase == CallPhase.USER_SPEAKING):
+                aborted = True
+                with contextlib.suppress(Exception):
+                    await self.cartesia_streaming_tts.cancel(context_id)
+                log.info("cartesia_stream_audio_skipped", response_id=response_id, reason="caller_speaking", chunks_sent=sent_count)
+                break
+            try:
+                chunk_bytes = len(base64.b64decode(payload, validate=True))
+            except Exception:
+                chunk_bytes = 0
+            audio_bytes += chunk_bytes
+            if sent_count == 0:
+                first_audio_at = monotonic()
+                self._set_assistant_speaking(True, "cartesia_stream_first_audio")
+                self._safe_transition(CallPhase.ASSISTANT_SPEAKING, "cartesia_stream_first_audio")
+                self.response_first_audio_at = first_audio_at
+                if self.first_audio_delta_at is None:
+                    self.first_audio_delta_at = first_audio_at
+                log.info(
+                    "assistant_audio_first_delta",
+                    response_id=response_id,
+                    source="cartesia_streaming",
+                    bytes=chunk_bytes,
+                    response_create_to_first_audio_ms=self._elapsed_ms(self.response_create_sent_at, first_audio_at),
+                    call_to_first_audio_ms=self._elapsed_ms(self.call_started_at, first_audio_at),
+                )
+                log.info(
+                    "cartesia_first_audio",
+                    response_id=response_id,
+                    source="streaming",
+                    first_audio_latency_ms=self._elapsed_ms(self.response_create_sent_at, first_audio_at),
+                )
+            if self._enqueue_twilio_message({"event": "media", "streamSid": self.state.stream_sid, "media": {"payload": payload}}, "audio"):
+                sent_count += 1
+                self.metrics.inc("voice_twilio_media_sent_total")
+        self.cartesia_stream_contexts.pop(response_id, None)
+        if aborted:
+            return 0
+        if sent_count == 0:
+            return 0
+        self.twilio_media_sent_count += sent_count
+        self.response_audio_sent_counts[response_id] = self.response_audio_sent_counts.get(response_id, 0) + sent_count
+        self.last_assistant_audio_at = monotonic()
+        log.info(
+            "twilio_audio_sent",
+            response_id=response_id,
+            source="cartesia_streaming",
+            chunks=sent_count,
+            audio_bytes=audio_bytes,
+            first_audio_ms=self._elapsed_ms(self.response_create_sent_at, first_audio_at),
+        )
+        await self._send_twilio_mark(response_id)
+        return sent_count
 
     async def _send_twilio_ulaw_audio(self, audio: bytes, *, response_id: str) -> int:
         if not audio or not self.state or not self.state.stream_sid:
@@ -1398,14 +1621,14 @@ class TwilioMediaSession:
                 # Greeting was a confirm-name line — now speak the actual intro
                 if self._using_cartesia_tts():
                     await self._speak_fixed_text(
-                        OUTGOING_INTRO_LINE,
+                        self._outgoing_intro_text(),
                         response_id="cartesia-outgoing-intro",
                         reason="outgoing_intro",
                     )
                     return
                 await self._request_assistant_response(
                     "Say exactly this one line, then stop. Do not add anything else:\n"
-                    f"{OUTGOING_INTRO_LINE}",
+                    f"{self._outgoing_intro_text()}",
                     reason="outgoing_intro",
                     force=True,
                 )
@@ -1446,9 +1669,10 @@ class TwilioMediaSession:
                 + "\n\n"
                 + build_dynamic_response_context(
                     get_persona_context(language),
-                    build_memory_context(self.customer_memory),
-                    language_context=get_language_context(self.customer_memory),
-                )
+                build_memory_context(self.customer_memory),
+                language_context=get_language_context(self.customer_memory),
+                recent_response_context=self._recent_assistant_response_context(),
+            )
                 + f"\n\nCaller is busy. Confirm callback at {callback_time}.\n"
                 "Reply in one short line, then close."
             )
@@ -1471,10 +1695,132 @@ class TwilioMediaSession:
                 objection_context=get_objection_context(self.customer_memory) if self.customer_memory.get("objections") else "",
                 language_context=get_language_context(self.customer_memory),
                 matched_project_context=project_context(self.customer_memory),
+                conversation_intelligence_context=self._conversation_intelligence_context(),
+                recent_response_context=self._recent_assistant_response_context(),
             )
+            + "\n\n"
+            + self._smart_question_context()
+            + "\n\n"
+            + self._response_length_context()
             + f"\n\nDo not ask: {do_not_ask or 'none'}.\n"
             "Reply now. One sentence only."
         )
+
+    def _recent_assistant_response_context(self) -> str:
+        recent = [
+            turn["text"]
+            for turn in self.transcript_turns
+            if turn.get("role") == "assistant" and turn.get("text")
+        ][-10:]
+        if not recent:
+            return ""
+        lines = ["Recent assistant replies to avoid repeating:"]
+        for text in recent:
+            lines.append(f"- {_preview(text, 120)}")
+        lines.append("Avoid repeating their openings, fillers, question pattern, recommendation phrase, and closing style.")
+        return "\n".join(lines)
+
+    def _conversation_intelligence_context(self) -> str:
+        latest_user = next(
+            (turn.get("text", "") for turn in reversed(self.transcript_turns) if turn.get("role") == "user"),
+            "",
+        )
+        emotion = self._infer_customer_emotion(latest_user)
+        urgency = self._infer_response_urgency(latest_user)
+        missing = self._highest_value_missing_field()
+        return (
+            "Conversation intelligence:\n"
+            f"- Likely customer emotion/state: {emotion}.\n"
+            f"- Response urgency: {urgency}.\n"
+            f"- Highest-value missing info: {missing or 'none'}.\n"
+            "- Do one job only: answer, clarify, reassure, guide, recommend, or close.\n"
+            "- If direct question, answer first. If story/concern, acknowledge briefly before guiding.\n"
+            "- Do not ask the missing info unless it naturally follows from the caller's current intent."
+        )
+
+    def _infer_customer_emotion(self, text: str) -> str:
+        lowered = str(text or "").lower()
+        if any(term in lowered for term in ("busy", "abhi nahi", "baad mein", "later", "meeting", "free nahi")):
+            return "busy"
+        if any(term in lowered for term in ("kaun", "kyu", "kyun", "why", "ai", "scam", "fraud", "genuine", "enquiry nahi")):
+            return "suspicious"
+        if any(term in lowered for term in ("mehenga", "costly", "budget high", "price high", "zyada")):
+            return "price sensitive"
+        if any(term in lowered for term in ("family", "wife", "husband", "parents", "ghar wale")):
+            return "family decision"
+        if any(term in lowered for term in ("investment", "roi", "rental income", "rent out")):
+            return "investment buyer"
+        if any(term in lowered for term in ("compare", "dusra", "aur option", "better option")):
+            return "comparing"
+        if any(term in lowered for term in ("visit", "site", "location bhej", "whatsapp", "brochure")):
+            return "interested"
+        if len(lowered.split()) <= 2:
+            return "low signal"
+        return "neutral"
+
+    def _infer_response_urgency(self, text: str) -> str:
+        cleaned = str(text or "").strip()
+        if "?" in cleaned or any(term in cleaned.lower() for term in ("price", "rate", "kab", "kaun", "where", "why", "visit")):
+            return "direct question - answer immediately"
+        if len(cleaned.split()) <= 2:
+            return "short reply - keep very brief"
+        if len(cleaned.split()) >= 22:
+            return "long explanation - acknowledge then guide"
+        return "normal - concise natural response"
+
+    def _highest_value_missing_field(self) -> str | None:
+        priority = (
+            ("location_interest", "location"),
+            ("bhk", "BHK"),
+            ("budget", "budget"),
+            ("purpose", "purpose"),
+            ("timeline", "timeline"),
+        )
+        for field, label in priority:
+            if can_ask(self.customer_memory, field):
+                return label
+        return None
+
+    def _smart_question_context(self) -> str:
+        missing = []
+        for field, label in (
+            ("location_interest", "preferred location"),
+            ("bhk", "BHK"),
+            ("purpose", "self-use or investment"),
+            ("budget", "budget"),
+            ("visit_interest", "site visit interest"),
+        ):
+            if can_ask(self.customer_memory, field):
+                missing.append((field, label))
+        if not missing:
+            return "Smart question selection:\n- No missing high-value field. Do not ask a discovery question unless caller asks."
+        known_count = sum(
+            1
+            for field in ("location_interest", "bhk", "property_type", "purpose", "budget", "visit_interest")
+            if self.customer_memory.get(field)
+        )
+        highest = missing[0][1]
+        if known_count >= 3 and self.customer_memory.get("visit_interest"):
+            return "Smart question selection:\n- Enough context exists. Prefer recommendation/visit confirmation over more discovery."
+        return (
+            "Smart question selection:\n"
+            f"- Highest-value missing info: {highest}.\n"
+            "- Ask it only if the caller's current concern has already been addressed."
+        )
+
+    def _response_length_context(self) -> str:
+        latest_user = next(
+            (turn.get("text", "") for turn in reversed(self.transcript_turns) if turn.get("role") == "user"),
+            "",
+        )
+        words = len(str(latest_user).split())
+        if words <= 2:
+            guidance = "Caller gave a very short reply. Keep answer very short; don't over-explain."
+        elif words <= 18:
+            guidance = "Caller gave a normal reply. Keep response compact and natural."
+        else:
+            guidance = "Caller explained more. Acknowledge the main point briefly, then guide."
+        return f"Response length controller:\n- {guidance}\n- Never speak longer than the caller unless clarification is necessary."
 
     def _forced_safety_response(self, text: str) -> str | None:
         lowered = str(text or "").lower()
@@ -1504,7 +1850,16 @@ class TwilioMediaSession:
         )
         if not customer_name:
             return "Haan ji, main Riya bol rahi hoon DreamHome se. Property enquiry ke baare mein call kiya tha."
-        return OUTGOING_CONFIRM_LINE.format(customer_name=customer_name)
+        seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:greeting"
+        return choose_conversation_variant(OUTGOING_CONFIRM_OPTIONS, seed).format(customer_name=customer_name)
+
+    def _outgoing_intro_text(self) -> str:
+        seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:intro"
+        return choose_conversation_variant(OUTGOING_INTRO_OPTIONS, seed)
+
+    def _closing_text(self, reason: str) -> str:
+        seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:{reason}:closing"
+        return choose_conversation_variant(CLOSING_OPTIONS, seed)
 
     def _greeting_has_customer_name(self) -> bool:
         return bool(
@@ -1645,6 +2000,13 @@ class TwilioMediaSession:
             self.mark_response_ids.clear()
         if hasattr(self, "cartesia_tts_active"):
             self.cartesia_tts_active.clear()
+        if hasattr(self, "cartesia_streaming_tts") and self.cartesia_streaming_tts:
+            active_contexts = list(getattr(self, "cartesia_stream_contexts", {}).values())
+            for context_id in active_contexts:
+                with contextlib.suppress(Exception):
+                    await self.cartesia_streaming_tts.cancel(context_id)
+            if hasattr(self, "cartesia_stream_contexts"):
+                self.cartesia_stream_contexts.clear()
         if hasattr(self, "openai_audio_fallback_parts"):
             self.openai_audio_fallback_parts.clear()
         self.response_completed_at = monotonic()
@@ -1654,6 +2016,7 @@ class TwilioMediaSession:
             cancelled_marks=cancelled_marks,
             cancelled_tts=cancelled_tts,
         )
+        log.debug("generation_cancelled", reason=reason, generation=self.response_manager.generation)
 
     async def _twilio_sender_loop(self) -> None:
         while not self.stopping:
@@ -1744,7 +2107,7 @@ class TwilioMediaSession:
             if self.call_started_at and monotonic() - self.call_started_at >= MAX_CALL_SECONDS:
                 log.info("call_max_duration_reached", max_call_seconds=MAX_CALL_SECONDS)
                 self.close_after_current_response = True
-                await self._request_assistant_response("Sir, main details WhatsApp pe bhej deti hoon. Namaste ji.", reason="max_duration_close")
+                await self._request_assistant_response(self._closing_text("max_duration_close"), reason="max_duration_close")
                 continue
             if self.assistant_response_active or self.assistant_speaking or self.caller_speaking or self._greeting_locked():
                 continue
@@ -1760,7 +2123,7 @@ class TwilioMediaSession:
                 )
                 if self.silence_prompt_count >= MAX_SILENCE_PROMPTS:
                     self.close_after_current_response = True
-                    await self._request_assistant_response("Sir, main details WhatsApp pe bhej deti hoon. Namaste ji.", reason="silence_close")
+                    await self._request_assistant_response(self._closing_text("silence_close"), reason="silence_close")
                 else:
                     await self._request_assistant_response("Hello sir?", reason="silence_watchdog")
 
@@ -1782,6 +2145,9 @@ class TwilioMediaSession:
         self.stopping = True
         self._transition(CallPhase.FAILED if failure_reason else CallPhase.CALL_ENDING, failure_reason or "normal_stop")
         await self._close_openai()
+        if self.cartesia_streaming_tts:
+            with contextlib.suppress(Exception):
+                await self.cartesia_streaming_tts.close()
         if self.cartesia_tts:
             with contextlib.suppress(Exception):
                 await self.cartesia_tts.close()
@@ -1929,8 +2295,8 @@ def _realtime_instructions(language: str = "hinglish") -> str:
         + get_persona_context(language)
         + "\n\nCall rules:\n"
         "- Greeting already sent. Never repeat it.\n"
-        "- React pehle, phir respond. Short rakhna.\n"
-        "- Silence se mat ghabrao. Pressure mat daalo.\n"
+        "- Reaction optional hai. Har reply filler se start mat karo.\n"
+        "- Short rakhna. Silence se mat ghabrao. Pressure mat daalo.\n"
         "- Current language mein raho unless caller explicitly switches.\n"
         "- Off-topic sawaal par same language mein short redirect.\n"
         "- If caller busy, ask callback time and close warmly.\n"
@@ -1965,6 +2331,29 @@ def _serialize_text(value: Any) -> str | None:
     if isinstance(value, dict):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def _first_streamable_fragment(text: str) -> str | None:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return None
+    natural_short = {"haan.", "hmm.", "okay.", "right.", "theek.", "bilkul."}
+    if normalized.lower() in natural_short:
+        return normalized
+    min_chars = 28
+    for index, char in enumerate(normalized):
+        if char in ".?!।":
+            candidate = normalized[: index + 1].strip()
+            if len(candidate) >= min_chars or candidate.lower() in natural_short:
+                return candidate
+    comma_at = normalized.find(",")
+    if comma_at >= 45:
+        return normalized[: comma_at + 1].strip()
+    if len(normalized) >= 90:
+        split_at = normalized.rfind(" ", 0, 90)
+        if split_at >= min_chars:
+            return normalized[:split_at].strip()
+    return None
 
 
 def _preview(text: str, limit: int = 600) -> str:

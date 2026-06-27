@@ -71,14 +71,40 @@ def match_project(memory: dict[str, Any]) -> dict[str, str] | None:
 
 def project_context(memory: dict[str, Any]) -> str:
     match = match_project(memory)
+    confidence = recommendation_confidence(memory, match)
     if not match:
-        return ""
+        return (
+            "Recommendation confidence:\n"
+            f"- Score: {confidence}\n"
+            "- Below 70. Do not recommend yet; ask one natural clarification if useful."
+        )
     return (
         "Matched project:\n"
         f"- Project: {match['project_name']}\n"
         f"- Reason: {match['reason']}\n"
+        f"- Recommendation confidence: {confidence}/100\n"
+        f"- Action: {'Recommend now' if confidence >= 70 else 'Ask one clarification before recommending'}\n"
         "- Use only this project unless caller explicitly asks for comparison."
     )
+
+
+def recommendation_confidence(memory: dict[str, Any], match: dict[str, str] | None = None) -> int:
+    score = 0
+    if match:
+        score += 30
+    if memory.get("location_interest") or memory.get("preferred_location"):
+        score += 20
+    if memory.get("bhk") or memory.get("property_type"):
+        score += 20
+    if memory.get("budget"):
+        score += 15
+    if memory.get("purpose") or memory.get("self_use_or_investment"):
+        score += 10
+    if memory.get("timeline") or memory.get("buying_timeline"):
+        score += 5
+    if not match:
+        return min(score, 65)
+    return min(score, 100)
 
 
 def _result(project_key: str, bhk: str) -> dict[str, str]:
