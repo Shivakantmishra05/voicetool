@@ -1710,14 +1710,12 @@ class TwilioMediaSession:
         if self.customer_memory.get("callback_requested"):
             callback_time = self.customer_memory.get("callback_time") or "unspecified time"
             return (
-                SYSTEM_PROMPT
-                + "\n\n"
-                + build_dynamic_response_context(
+                build_dynamic_response_context(
                     get_persona_context(language),
-                build_memory_context(self.customer_memory),
-                language_context=get_language_context(self.customer_memory),
-                recent_response_context=self._recent_assistant_response_context(),
-            )
+                    build_memory_context(self.customer_memory),
+                    language_context=get_language_context(self.customer_memory),
+                    recent_response_context=self._recent_assistant_response_context(),
+                )
                 + f"\n\nCaller is busy. Confirm callback at {callback_time}.\n"
                 "Reply in one short line, then close."
             )
@@ -1729,9 +1727,7 @@ class TwilioMediaSession:
         )
 
         return (
-            SYSTEM_PROMPT
-            + "\n\n"
-            + build_dynamic_response_context(
+            build_dynamic_response_context(
                 get_persona_context(language),
                 build_memory_context(self.customer_memory),
                 stage_context=get_stage_context(self.customer_memory) if stage in ("SITE_VISIT_BOOKING", "CLOSING") else "",
