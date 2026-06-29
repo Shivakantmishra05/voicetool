@@ -27,8 +27,8 @@ from app.services.stt import DeepgramSTTStream
 from app.services.supabase_crm import SupabaseCRM
 from app.telephony.stream_auth import StreamClaims, StreamTokenService
 from app.utils.logging import call_sid_ctx, log
-from app.prompts.real_estate_agent import OUTGOING_INTRO_LINE
-from app.websocket.twilio_media import CallPhase, TwilioMediaSession
+from app.prompts.real_estate_agent import OPENING_PERMISSION_DECLINED_LINE, OUTGOING_REASON_PERMISSION_LINE
+from app.websocket.twilio_media import CallPhase, TwilioMediaSession, _is_opening_affirmative
 
 TEXT_GREETING_LOCK_SECONDS = 3.5
 TEXT_BARGE_IN_DEBOUNCE_SECONDS = 0.45
@@ -271,12 +271,35 @@ class TwilioTextStreamingSession(TwilioMediaSession):
             return
 
         if not self.customer_memory.get("intro_delivered"):
+            self._drop_last_short_user_turn(text, reason="intro_confirmation")
+            opening_step = str(self.customer_memory.get("opening_step") or "confirmed").strip()
+            if opening_step == "confirmed":
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {"opening_step": "identity_delivered", "conversation_stage": "INTRO"},
+                )
+                await self._speak_text(self._outgoing_intro_text(), reason="outgoing_intro")
+                return
+            if opening_step == "identity_delivered":
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {"opening_step": "permission_asked", "conversation_stage": "INTRO"},
+                )
+                await self._speak_text(OUTGOING_REASON_PERMISSION_LINE, reason="outgoing_permission")
+                return
+            if not _is_opening_affirmative(text):
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {"intro_delivered": True, "opening_step": "permission_declined", "conversation_stage": "CLOSING"},
+                )
+                await self._speak_text(OPENING_PERMISSION_DECLINED_LINE, reason="opening_permission_declined")
+                self._spawn(self._stop_after_response(), "close_after_response")
+                return
             self.customer_memory = await self.call_memory.update_memory(
                 self.state.call_sid,
-                {"intro_delivered": True, "conversation_stage": "INTRO"},
+                {"intro_delivered": True, "opening_step": "discovery_started", "conversation_stage": "DISCOVERY"},
             )
-            self._drop_last_short_user_turn(text, reason="intro_confirmation")
-            await self._speak_text(OUTGOING_INTRO_LINE, reason="outgoing_intro")
+            await self._speak_text(self._first_discovery_text(), reason="first_discovery")
             return
 
         await self._generate_text_response(self._build_response_instructions(), reason="user_transcript")
@@ -301,7 +324,7 @@ class TwilioTextStreamingSession(TwilioMediaSession):
             await asyncio.sleep(2.0)
             if self.call_started_at and monotonic() - self.call_started_at >= 210.0:
                 log.info("call_max_duration_reached", max_call_seconds=210.0, pipeline="text_streaming")
-                await self._speak_text("Sir, main details WhatsApp pe bhej deti hoon. Namaste ji.", reason="max_duration_close")
+                await self._speak_text(self._closing_text("max_duration_close"), reason="max_duration_close")
                 self._spawn(self._stop_after_response(), "close_after_response")
                 return
             if self.assistant_speaking or self.caller_speaking or monotonic() < self.text_greeting_locked_until:
@@ -318,7 +341,7 @@ class TwilioTextStreamingSession(TwilioMediaSession):
                 silence_prompt_count=self.silence_prompt_count,
             )
             if self.silence_prompt_count >= 2:
-                await self._speak_text("Sir, main details WhatsApp pe bhej deti hoon. Namaste ji.", reason="silence_close")
+                await self._speak_text(self._closing_text("silence_close"), reason="silence_close")
                 self._spawn(self._stop_after_response(), "close_after_response")
                 return
             await self._speak_text("Hello sir?", reason="silence_watchdog")

@@ -30,10 +30,14 @@ from app.database.session import SessionLocal
 from app.models import Call
 from app.prompts.real_estate_agent import (
     CLOSING_OPTIONS,
+    FIRST_DISCOVERY_LINE,
     SYSTEM_PROMPT,
     OUTGOING_CONFIRM_OPTIONS,
+    OUTGOING_CONFIRM_FALLBACK_LINE,
     OUTGOING_INTRO_OPTIONS,
-    OUTGOING_INTRO_LINE,
+    OPENING_PERMISSION_DECLINED_LINE,
+    OUTGOING_REASON_PERMISSION_LINE,
+    UNSUPPORTED_AREA_LINE,
     build_dynamic_response_context,
     choose_conversation_variant,
 )
@@ -69,10 +73,7 @@ CRITICAL_BACKGROUND_TASKS = {
     "openai_realtime_connector",
     "openai_realtime_receiver",
 }
-UNSUPPORTED_AREA_RESPONSE = (
-    "Woh area hamare paas covered nahi hai abhi. Hamare projects Greater Noida West mein hain — "
-    "agar kabhi us side consider karo toh batana."
-)
+UNSUPPORTED_AREA_RESPONSE = UNSUPPORTED_AREA_LINE
 AI_IDENTITY_RESPONSE_HINDI = "Nahi sir, main Riya hoon DreamHome se."
 AI_IDENTITY_RESPONSE_ENGLISH = "No sir, this is Riya from DreamHome."
 CALL_REASON_RESPONSE = "Aapki property enquiry receive hui thi sir, isi liye follow-up call tha."
@@ -1648,41 +1649,92 @@ class TwilioMediaSession:
             )
             return
         if not self.customer_memory.get("intro_delivered"):
-            # If no customer_name, greeting was already the intro (direct intro line).
-            # Skip OUTGOING_INTRO_LINE to avoid speaking intro twice.
             customer_name = (
                 str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
                 or getattr(self.claims, "customer_name", None)
             )
+            self._drop_last_short_user_turn(text, reason="intro_confirmation")
+            opening_step = str(self.customer_memory.get("opening_step") or "confirmed").strip()
+            if opening_step == "confirmed":
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {
+                        "opening_step": "identity_delivered",
+                        "conversation_stage": "INTRO",
+                    },
+                )
+                await self._speak_opening_line(self._outgoing_intro_text(), response_id="cartesia-outgoing-intro", reason="outgoing_intro")
+                return
+            if opening_step == "identity_delivered":
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {
+                        "opening_step": "permission_asked",
+                        "conversation_stage": "INTRO",
+                    },
+                )
+                await self._speak_opening_line(
+                    OUTGOING_REASON_PERMISSION_LINE,
+                    response_id="cartesia-outgoing-permission",
+                    reason="outgoing_permission",
+                )
+                return
+            if not _is_opening_affirmative(text):
+                self.close_after_current_response = True
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {
+                        "intro_delivered": True,
+                        "opening_step": "permission_declined",
+                        "conversation_stage": "CLOSING",
+                    },
+                )
+                await self._speak_opening_line(
+                    OPENING_PERMISSION_DECLINED_LINE,
+                    response_id="cartesia-opening-declined",
+                    reason="opening_permission_declined",
+                )
+                return
             self.customer_memory = await self.call_memory.update_memory(
                 self.state.call_sid,
                 {
                     "intro_delivered": True,
-                    "conversation_stage": "INTRO",
+                    "opening_step": "discovery_started",
+                    "conversation_stage": "DISCOVERY",
                 },
             )
-            self._drop_last_short_user_turn(text, reason="intro_confirmation")
-            if customer_name:
-                # Greeting was a confirm-name line — now speak the actual intro
-                if self._using_cartesia_tts():
-                    await self._speak_fixed_text(
-                        self._outgoing_intro_text(),
-                        response_id="cartesia-outgoing-intro",
-                        reason="outgoing_intro",
-                    )
-                    return
-                await self._request_assistant_response(
-                    "Say exactly this one line, then stop. Do not add anything else:\n"
-                    f"{self._outgoing_intro_text()}",
-                    reason="outgoing_intro",
-                    force=True,
-                )
-            # No customer_name: greeting was already the intro — skip to discovery
+            await self._speak_opening_line(
+                self._first_discovery_text(),
+                response_id="cartesia-first-discovery",
+                reason="first_discovery",
+            )
             return
         await self._request_assistant_response(
             self._build_response_instructions(),
             reason="user_transcript",
         )
+
+    async def _speak_opening_line(self, text: str, *, response_id: str, reason: str) -> None:
+        if self._using_cartesia_tts():
+            await self._speak_fixed_text(text, response_id=response_id, reason=reason)
+            return
+        await self._request_assistant_response(
+            "Say exactly this one line, then stop and wait for the caller. Do not add anything else:\n"
+            f"{text}",
+            reason=reason,
+            force=True,
+        )
+
+    def _first_discovery_text(self) -> str:
+        if can_ask(self.customer_memory, "location_interest"):
+            return FIRST_DISCOVERY_LINE
+        if can_ask(self.customer_memory, "bhk"):
+            return "Us side options mil jaate hain. 2 BHK dekh rahe hain ya 3 BHK?"
+        if can_ask(self.customer_memory, "purpose"):
+            return "Theek. Khud rehne ke liye dekh rahe hain ya investment?"
+        if can_ask(self.customer_memory, "timeline"):
+            return "Aap immediate dekh rahe hain ya thoda time hai?"
+        return "Theek hai, us hisaab se options dekh leti hoon."
 
     async def _record_assistant_question(self, transcript: str | None) -> None:
         if not self.state:
@@ -1999,7 +2051,7 @@ class TwilioMediaSession:
             or getattr(self.claims, "customer_name", None)
         )
         if not customer_name:
-            return OUTGOING_INTRO_LINE
+            return OUTGOING_CONFIRM_FALLBACK_LINE
         seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:greeting"
         return choose_conversation_variant(OUTGOING_CONFIRM_OPTIONS, seed).format(customer_name=customer_name)
 
@@ -2566,3 +2618,26 @@ def _infer_sentence_shape(text: str) -> str:
     if len(words) <= 8:
         return "answer then stop"
     return "answer only"
+
+
+def _is_opening_affirmative(text: str) -> bool:
+    lowered = str(text or "").lower()
+    negative_terms = ("nahi", "nahin", "no", "busy", "abhi nahi", "baad mein", "later", "mat call")
+    if any(term in lowered for term in negative_terms):
+        return False
+    affirmative_terms = (
+        "haan",
+        "ha",
+        "ji",
+        "yes",
+        "yeah",
+        "yep",
+        "bataiye",
+        "boliye",
+        "kariye",
+        "kar sakte",
+        "sure",
+        "okay",
+        "ok",
+    )
+    return any(term in lowered for term in affirmative_terms)
