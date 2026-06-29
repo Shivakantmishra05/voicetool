@@ -75,6 +75,14 @@ UNSUPPORTED_AREA_RESPONSE = (
 AI_IDENTITY_RESPONSE_HINDI = "Nahi sir, main Riya hoon DreamHome se."
 AI_IDENTITY_RESPONSE_ENGLISH = "No sir, this is Riya from DreamHome."
 CALL_REASON_RESPONSE = "Aapki property enquiry receive hui thi sir, isi liye follow-up call tha."
+ENQUIRY_CLARIFICATION_RESPONSE = (
+    "Ho sakta hai website ya online portal ke through enquiry register hui ho. "
+    "Agar abhi property dekh rahe hain to main short mein options bata sakti hoon."
+)
+NO_ENQUIRY_RESPONSE = (
+    "Koi baat nahi sir, shayad number galti se register ho gaya ho. "
+    "Future mein property related help chahiye ho to zaroor batayiyega. Thank you."
+)
 CALL_REASON_TERMS = (
     "call kyu",
     "call kyun",
@@ -94,6 +102,29 @@ CALL_REASON_TERMS = (
     "क्यों call",
     "क्यों किया",
     "किसलिए call",
+)
+ENQUIRY_CLARIFICATION_TERMS = (
+    "kaunsi enquiry",
+    "kaun si enquiry",
+    "konsi enquiry",
+    "which enquiry",
+    "what enquiry",
+    "कौन सी enquiry",
+    "कौनसी enquiry",
+)
+NO_ENQUIRY_TERMS = (
+    "maine enquiry nahi ki",
+    "maine inquiry nahi ki",
+    "enquiry nahi ki",
+    "inquiry nahi ki",
+    "i did not enquire",
+    "i didn't enquire",
+    "i did not inquire",
+    "i didn't inquire",
+    "no enquiry",
+    "no inquiry",
+    "मैंने enquiry नहीं",
+    "मैंने inquiry नहीं",
 )
 UNSUPPORTED_INVENTORY_TERMS = (
     "sector 62",
@@ -1877,6 +1908,13 @@ class TwilioMediaSession:
         if any(term in lowered for term in CALL_REASON_TERMS):
             log.info("call_reason_forced_response", transcript_preview=_preview(text, 180))
             return CALL_REASON_RESPONSE
+        if any(term in lowered for term in NO_ENQUIRY_TERMS):
+            log.info("no_enquiry_forced_response", transcript_preview=_preview(text, 180))
+            self.close_after_current_response = True
+            return NO_ENQUIRY_RESPONSE
+        if any(term in lowered for term in ENQUIRY_CLARIFICATION_TERMS):
+            log.info("enquiry_clarification_forced_response", transcript_preview=_preview(text, 180))
+            return ENQUIRY_CLARIFICATION_RESPONSE
         if any(term in lowered for term in UNSUPPORTED_INVENTORY_TERMS):
             log.warning("unsupported_inventory_forced_response", transcript_preview=_preview(text, 180))
             return UNSUPPORTED_AREA_RESPONSE
@@ -1905,7 +1943,12 @@ class TwilioMediaSession:
 
     def _outgoing_intro_text(self) -> str:
         seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:intro"
-        return choose_conversation_variant(OUTGOING_INTRO_OPTIONS, seed)
+        customer_name = (
+            str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
+            or getattr(self.claims, "customer_name", None)
+            or "sir"
+        )
+        return choose_conversation_variant(OUTGOING_INTRO_OPTIONS, seed).format(customer_name=customer_name)
 
     def _closing_text(self, reason: str) -> str:
         seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:{reason}:closing"
