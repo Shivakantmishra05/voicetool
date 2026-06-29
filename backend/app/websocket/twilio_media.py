@@ -1703,7 +1703,7 @@ class TwilioMediaSession:
             + "\n\n"
             + self._response_length_context()
             + f"\n\nDo not ask: {do_not_ask or 'none'}.\n"
-            "Reply now. One sentence only."
+            "Reply now. One conversational job only. Usually 8-15 words; no question unless useful."
         )
 
     def _recent_assistant_response_context(self) -> str:
@@ -1711,13 +1711,15 @@ class TwilioMediaSession:
             turn["text"]
             for turn in self.transcript_turns
             if turn.get("role") == "assistant" and turn.get("text")
-        ][-10:]
+        ][-15:]
         if not recent:
             return ""
         lines = ["Recent assistant replies to avoid repeating:"]
         for text in recent:
             lines.append(f"- {_preview(text, 120)}")
-        lines.append("Avoid repeating their openings, fillers, question pattern, recommendation phrase, and closing style.")
+        lines.append(
+            "Avoid repeating their openings, fillers, sentence length, question pattern, recommendation phrase, and closing style."
+        )
         return "\n".join(lines)
 
     def _conversation_intelligence_context(self) -> str:
@@ -1726,17 +1728,46 @@ class TwilioMediaSession:
             "",
         )
         emotion = self._infer_customer_emotion(latest_user)
+        intent = self._infer_customer_intent(latest_user)
         urgency = self._infer_response_urgency(latest_user)
+        rhythm = self._infer_response_rhythm(latest_user, intent)
         missing = self._highest_value_missing_field()
         return (
             "Conversation intelligence:\n"
+            f"- Latest customer intent: {intent}.\n"
             f"- Likely customer emotion/state: {emotion}.\n"
             f"- Response urgency: {urgency}.\n"
+            f"- Suggested rhythm: {rhythm}.\n"
             f"- Highest-value missing info: {missing or 'none'}.\n"
-            "- Do one job only: answer, clarify, reassure, guide, recommend, or close.\n"
+            "- Satisfy latest intent before discovery or CRM.\n"
+            "- Pick one mode only: answer, empathy, clarification, guidance, recommendation, or question.\n"
             "- If direct question, answer first. If story/concern, acknowledge briefly before guiding.\n"
             "- Do not ask the missing info unless it naturally follows from the caller's current intent."
         )
+
+    def _infer_customer_intent(self, text: str) -> str:
+        lowered = str(text or "").lower()
+        if any(term in lowered for term in ("bye", "band", "stop", "not interested", "mat call", "remove", "cut")):
+            return "ending conversation"
+        if any(term in lowered for term in ("busy", "abhi nahi", "baad mein", "later", "meeting", "free nahi")):
+            return "busy"
+        if any(term in lowered for term in ("kyu", "kyun", "why", "kaun", "kisliye", "enquiry nahi", "number kahan")):
+            return "asking for clarification"
+        if any(term in lowered for term in ("ai", "robot", "scam", "fraud", "genuine")):
+            return "suspicious"
+        if any(term in lowered for term in ("recommend", "suggest", "best", "kaunsa", "which one")):
+            return "asking recommendation"
+        if any(term in lowered for term in ("price", "rate", "cost", "kitna", "budget", "possession", "location", "amenity")):
+            return "asking information"
+        if any(term in lowered for term in ("compare", "comparison", "dusra", "aur option", "better option")):
+            return "comparing"
+        if any(term in lowered for term in ("soch", "think", "family", "discuss", "ghar wale")):
+            return "thinking"
+        if any(term in lowered for term in ("visit", "site", "whatsapp", "brochure", "bhej", "book")):
+            return "ready to buy"
+        if any(term in lowered for term in ("samjha nahi", "confuse", "clear nahi", "repeat")):
+            return "confused"
+        return "continuing conversation"
 
     def _infer_customer_emotion(self, text: str) -> str:
         lowered = str(text or "").lower()
@@ -1767,6 +1798,20 @@ class TwilioMediaSession:
         if len(cleaned.split()) >= 22:
             return "long explanation - acknowledge then guide"
         return "normal - concise natural response"
+
+    def _infer_response_rhythm(self, text: str, intent: str) -> str:
+        words = len(str(text or "").split())
+        if intent in {"ending conversation", "busy"}:
+            return "short close or callback confirmation"
+        if intent in {"asking information", "asking for clarification", "suspicious"}:
+            return "direct answer first"
+        if intent == "asking recommendation":
+            return "one project, one reason, then stop"
+        if words <= 2:
+            return "short"
+        if words >= 22:
+            return "brief acknowledgement, then guidance"
+        return "medium conversational"
 
     def _highest_value_missing_field(self) -> str | None:
         priority = (
@@ -1805,7 +1850,7 @@ class TwilioMediaSession:
         return (
             "Smart question selection:\n"
             f"- Highest-value missing info: {highest}.\n"
-            "- Ask it only if the caller's current concern has already been addressed."
+            "- CRM completion is secondary. Ask it only if the caller's current intent has already been satisfied."
         )
 
     def _response_length_context(self) -> str:
@@ -1820,7 +1865,12 @@ class TwilioMediaSession:
             guidance = "Caller gave a normal reply. Keep response compact and natural."
         else:
             guidance = "Caller explained more. Acknowledge the main point briefly, then guide."
-        return f"Response length controller:\n- {guidance}\n- Never speak longer than the caller unless clarification is necessary."
+        return (
+            "Response length controller:\n"
+            f"- {guidance}\n"
+            "- Average 8-15 words; allow 20 only when caller needs a real answer.\n"
+            "- Never speak longer than the caller unless clarification is necessary."
+        )
 
     def _forced_safety_response(self, text: str) -> str | None:
         lowered = str(text or "").lower()
