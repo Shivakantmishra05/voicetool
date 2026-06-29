@@ -132,6 +132,11 @@ class CallMemoryManager:
                 changed = True
                 continue
 
+            if field == "opening_step" and value != memory.get(field):
+                memory[field] = value
+                changed = True
+                continue
+
             if field == "language" and value in {"hinglish", "hindi", "english"} and value != memory.get(field):
                 memory[field] = value
                 changed = True
