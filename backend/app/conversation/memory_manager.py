@@ -38,7 +38,6 @@ DEFAULT_MEMORY: dict[str, Any] = {
     "callback_time": None,
     # Conversation state
     "conversation_stage": "INTRO",
-    "opening_step": None,
     "not_interested_count": 0,
     "intro_delivered": False,
     "objections": [],
@@ -129,11 +128,6 @@ class CallMemoryManager:
 
             if field == "callback_requested" and value != memory.get(field):
                 memory[field] = bool(value)
-                changed = True
-                continue
-
-            if field == "opening_step" and value != memory.get(field):
-                memory[field] = value
                 changed = True
                 continue
 

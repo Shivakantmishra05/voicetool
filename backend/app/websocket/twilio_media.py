@@ -364,6 +364,7 @@ class TwilioMediaSession:
         self.openai_recovering = False
         self._transcript_lock = asyncio.Lock()
         self.phase = CallPhase.NEW
+        self.opening_step: str | None = None
 
     async def run(self) -> None:
         await self.websocket.accept()
@@ -461,9 +462,10 @@ class TwilioMediaSession:
         cartesia_greeting_started = False
         if self._using_cartesia_tts():
             greeting_text = self._greeting_text()
+            self.opening_step = "hello_delivered"
             self.customer_memory = await self.call_memory.update_memory(
                 self.state.call_sid,
-                {"opening_step": "hello_delivered", "conversation_stage": "INTRO"},
+                {"conversation_stage": "INTRO"},
             )
             self._spawn(self._speak_fixed_text(greeting_text, response_id="cartesia-greeting", reason="greeting"), "cartesia_greeting")
             cartesia_greeting_started = True
@@ -579,9 +581,10 @@ class TwilioMediaSession:
         if request_greeting:
             if self._using_cartesia_tts():
                 greeting_text = self._greeting_text()
+                self.opening_step = "hello_delivered"
                 self.customer_memory = await self.call_memory.update_memory(
                     self.state.call_sid,
-                    {"opening_step": "hello_delivered", "conversation_stage": "INTRO"},
+                    {"conversation_stage": "INTRO"},
                 )
                 await self._speak_fixed_text(greeting_text, response_id="cartesia-greeting", reason="greeting")
             else:
@@ -1627,6 +1630,7 @@ class TwilioMediaSession:
             log.info("pre_intro_transcript_ignored", reason="twilio_trial_notice")
             return
         if not self.customer_memory.get("intro_delivered") and self._opening_identity_requested(text):
+            self.opening_step = "identity_delivered"
             await self._speak_opening_line(
                 OPENING_IDENTITY_LINE,
                 response_id="cartesia-opening-identity-clarification",
@@ -1659,14 +1663,14 @@ class TwilioMediaSession:
             return
         if not self.customer_memory.get("intro_delivered"):
             self._drop_last_short_user_turn(text, reason="intro_confirmation")
-            opening_step = str(self.customer_memory.get("opening_step") or "hello_delivered").strip()
+            opening_step = str(self.opening_step or "hello_delivered").strip()
             if opening_step == "callback_requested":
                 self.close_after_current_response = True
+                self.opening_step = "callback_confirmed"
                 self.customer_memory = await self.call_memory.update_memory(
                     self.state.call_sid,
                     {
                         "intro_delivered": True,
-                        "opening_step": "callback_confirmed",
                         "conversation_stage": "CLOSING",
                     },
                 )
@@ -1677,11 +1681,11 @@ class TwilioMediaSession:
                 )
                 return
             if self._opening_busy_requested(text):
+                self.opening_step = "callback_requested"
                 self.customer_memory = await self.call_memory.update_memory(
                     self.state.call_sid,
                     {
                         "callback_requested": True,
-                        "opening_step": "callback_requested",
                         "conversation_stage": "INTRO",
                     },
                 )
@@ -1693,11 +1697,11 @@ class TwilioMediaSession:
                 return
             if self._opening_wrong_number(text):
                 self.close_after_current_response = True
+                self.opening_step = "wrong_number"
                 self.customer_memory = await self.call_memory.update_memory(
                     self.state.call_sid,
                     {
                         "intro_delivered": True,
-                        "opening_step": "wrong_number",
                         "conversation_stage": "CLOSING",
                     },
                 )
@@ -1708,23 +1712,23 @@ class TwilioMediaSession:
                 )
                 return
             if opening_step == "hello_delivered":
+                self.opening_step = "confirm_asked"
                 self.customer_memory = await self.call_memory.update_memory(
                     self.state.call_sid,
                     {
-                        "opening_step": "confirm_asked",
                         "conversation_stage": "INTRO",
                     },
                 )
                 await self._speak_opening_line(self._confirm_person_text(), response_id="cartesia-outgoing-confirm", reason="outgoing_confirm")
                 return
             if opening_step == "confirm_asked":
-                if not _is_opening_affirmative(text):
+                if self._opening_negative_requested(text):
                     self.close_after_current_response = True
+                    self.opening_step = "person_not_confirmed"
                     self.customer_memory = await self.call_memory.update_memory(
                         self.state.call_sid,
                         {
                             "intro_delivered": True,
-                            "opening_step": "person_not_confirmed",
                             "conversation_stage": "CLOSING",
                         },
                     )
@@ -1734,20 +1738,20 @@ class TwilioMediaSession:
                         reason="opening_person_not_confirmed",
                     )
                     return
+                self.opening_step = "identity_delivered"
                 self.customer_memory = await self.call_memory.update_memory(
                     self.state.call_sid,
                     {
-                        "opening_step": "identity_delivered",
                         "conversation_stage": "INTRO",
                     },
                 )
                 await self._speak_opening_line(OUTGOING_INTRO_LINE, response_id="cartesia-outgoing-intro", reason="outgoing_intro")
                 return
             if opening_step == "identity_delivered":
+                self.opening_step = "permission_asked"
                 self.customer_memory = await self.call_memory.update_memory(
                     self.state.call_sid,
                     {
-                        "opening_step": "permission_asked",
                         "conversation_stage": "INTRO",
                     },
                 )
@@ -1757,30 +1761,14 @@ class TwilioMediaSession:
                     reason="outgoing_permission",
                 )
                 return
-            if opening_step == "permission_asked" and not _is_opening_affirmative(text):
-                self.close_after_current_response = True
-                self.customer_memory = await self.call_memory.update_memory(
-                    self.state.call_sid,
-                    {
-                        "intro_delivered": True,
-                        "opening_step": "permission_declined",
-                        "conversation_stage": "CLOSING",
-                    },
-                )
-                await self._speak_opening_line(
-                    OPENING_PERMISSION_DECLINED_LINE,
-                    response_id="cartesia-opening-declined",
-                    reason="opening_permission_declined",
-                )
-                return
             if opening_step != "permission_asked":
                 log.warning("opening_step_unknown", opening_step=opening_step)
                 return
+            self.opening_step = "discovery_started"
             self.customer_memory = await self.call_memory.update_memory(
                 self.state.call_sid,
                 {
                     "intro_delivered": True,
-                    "opening_step": "discovery_started",
                     "conversation_stage": "DISCOVERY",
                 },
             )
@@ -1830,6 +1818,11 @@ class TwilioMediaSession:
     def _opening_wrong_number(text: str) -> bool:
         lowered = str(text or "").lower()
         return any(term in lowered for term in ("wrong number", "galat number", "गलत नंबर"))
+
+    @staticmethod
+    def _opening_negative_requested(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(term in lowered for term in ("nahi", "nahin", "no", "not me", "mat call"))
 
     def _first_discovery_text(self) -> str:
         if can_ask(self.customer_memory, "location_interest"):

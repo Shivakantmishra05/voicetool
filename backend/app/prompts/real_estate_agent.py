@@ -14,7 +14,7 @@ UNSUPPORTED_AREA_LINE = (
     "agar kabhi us side consider karo toh batana."
 )
 
-OPENING_HELLO_LINE = "Hello."
+OPENING_HELLO_LINE = "Hello"
 
 OUTGOING_CONFIRM_OPTIONS = (
     "Kya meri baat {customer_name} ji se ho rahi hai?",
