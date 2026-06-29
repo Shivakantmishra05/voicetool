@@ -33,6 +33,7 @@ from app.prompts.real_estate_agent import (
     SYSTEM_PROMPT,
     OUTGOING_CONFIRM_OPTIONS,
     OUTGOING_INTRO_OPTIONS,
+    OUTGOING_INTRO_LINE,
     build_dynamic_response_context,
     choose_conversation_variant,
 )
@@ -72,7 +73,7 @@ UNSUPPORTED_AREA_RESPONSE = (
     "Woh area hamare paas covered nahi hai abhi. Hamare projects Greater Noida West mein hain — "
     "agar kabhi us side consider karo toh batana."
 )
-AI_IDENTITY_RESPONSE_HINDI = "Nahi sir, main Riya hoon DreamHome se."
+AI_IDENTITY_RESPONSE_HINDI = "Nahi sir, main Riya hoon."
 AI_IDENTITY_RESPONSE_ENGLISH = "No sir, this is Riya from DreamHome."
 CALL_REASON_RESPONSE = "Aapki property enquiry receive hui thi sir, isi liye follow-up call tha."
 ENQUIRY_CLARIFICATION_RESPONSE = (
@@ -400,7 +401,14 @@ class TwilioMediaSession:
         start = message.get("start", {})
         call_sid = start.get("callSid") or message.get("callSid")
         stream_sid = start.get("streamSid") or message.get("streamSid")
-        caller = (start.get("customParameters") or {}).get("From")
+        custom_parameters = start.get("customParameters") or {}
+        caller = custom_parameters.get("From")
+        customer_name = (
+            custom_parameters.get("CustomerName")
+            or custom_parameters.get("customer_name")
+            or custom_parameters.get("Name")
+            or custom_parameters.get("name")
+        )
         media_format = start.get("mediaFormat") or {}
         if not call_sid or not stream_sid:
             raise ValueError("Twilio start message missing callSid or streamSid")
@@ -416,6 +424,12 @@ class TwilioMediaSession:
         self.state.caller_number = caller
         await self.memory.set(self.state)
         self.customer_memory = await self.call_memory.load_memory(call_sid)
+        if str(customer_name or "").strip():
+            self.customer_memory = await self.call_memory.update_memory(
+                call_sid,
+                {"customer_name": str(customer_name).strip(), "name": str(customer_name).strip()},
+            )
+            log.info("customer_name_loaded_from_twilio", has_customer_name=True)
 
         async with SessionLocal() as session:
             repo = CallRepository(session)
@@ -1937,7 +1951,7 @@ class TwilioMediaSession:
             or getattr(self.claims, "customer_name", None)
         )
         if not customer_name:
-            return "Haan ji, main Riya bol rahi hoon DreamHome se. Property enquiry ke baare mein call kiya tha."
+            return OUTGOING_INTRO_LINE
         seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:greeting"
         return choose_conversation_variant(OUTGOING_CONFIRM_OPTIONS, seed).format(customer_name=customer_name)
 

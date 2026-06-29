@@ -21,6 +21,14 @@ async def inbound_voice(request: Request, settings: Settings = Depends(get_setti
     call_sid = str(form.get("CallSid") or "")
     if not call_sid:
         return Response("<Response><Reject reason=\"rejected\"/></Response>", media_type="application/xml", status_code=400)
+    customer_name = (
+        request.query_params.get("customer_name")
+        or request.query_params.get("CustomerName")
+        or request.query_params.get("name")
+        or form.get("customer_name")
+        or form.get("CustomerName")
+        or form.get("Name")
+    )
     token_service: StreamTokenService = request.app.state.stream_tokens
     stream_token = token_service.issue(call_sid)
     log.info(
@@ -31,7 +39,10 @@ async def inbound_voice(request: Request, settings: Settings = Depends(get_setti
         token_preview=token_service.preview(stream_token),
     )
     request.app.state.metrics.observe_ms("twilio_webhook_latency", (perf_counter() - started) * 1000)
-    return Response(content=inbound_stream_twiml(settings, form.get("From"), stream_token), media_type="application/xml")
+    return Response(
+        content=inbound_stream_twiml(settings, form.get("From"), stream_token, str(customer_name or "").strip()),
+        media_type="application/xml",
+    )
 
 
 @router.post("/status")
