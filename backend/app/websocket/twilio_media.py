@@ -73,7 +73,7 @@ UNSUPPORTED_AREA_RESPONSE = (
     "Woh area hamare paas covered nahi hai abhi. Hamare projects Greater Noida West mein hain — "
     "agar kabhi us side consider karo toh batana."
 )
-AI_IDENTITY_RESPONSE_HINDI = "Nahi sir, main Riya hoon."
+AI_IDENTITY_RESPONSE_HINDI = "Nahi sir, main Riya hoon DreamHome se."
 AI_IDENTITY_RESPONSE_ENGLISH = "No sir, this is Riya from DreamHome."
 CALL_REASON_RESPONSE = "Aapki property enquiry receive hui thi sir, isi liye follow-up call tha."
 ENQUIRY_CLARIFICATION_RESPONSE = (
@@ -1742,9 +1742,11 @@ class TwilioMediaSession:
             + "\n\n"
             + self._smart_question_context()
             + "\n\n"
+            + self._sentence_shape_context()
+            + "\n\n"
             + self._response_length_context()
             + f"\n\nDo not ask: {do_not_ask or 'none'}.\n"
-            "Reply now. One conversational job only. Usually 8-15 words; no question unless useful."
+            "Reply now. One spoken thought. Usually 5-15 words; no question unless useful."
         )
 
     def _recent_assistant_response_context(self) -> str:
@@ -1759,8 +1761,14 @@ class TwilioMediaSession:
         for text in recent:
             lines.append(f"- {_preview(text, 120)}")
         lines.append(
-            "Avoid repeating their openings, fillers, sentence length, question pattern, recommendation phrase, and closing style."
+            "Avoid repeating openings, fillers, sentence length, question pattern, recommendation phrase, and closing style."
         )
+        openings = _recent_openings(recent)
+        if openings:
+            lines.append(f"Recent openings/fillers: {', '.join(openings)}. Avoid these now.")
+        recommendations = [text for text in recent if _looks_like_recommendation(text)]
+        if recommendations:
+            lines.append("Recent recommendation already given. Do not repeat it unless caller asks.")
         return "\n".join(lines)
 
     def _conversation_intelligence_context(self) -> str:
@@ -1774,18 +1782,61 @@ class TwilioMediaSession:
         rhythm = self._infer_response_rhythm(latest_user, intent)
         missing = self._highest_value_missing_field()
         return (
-            "Conversation intelligence:\n"
+            "Private conversation read:\n"
             f"- Latest customer intent: {intent}.\n"
             f"- Likely customer emotion/state: {emotion}.\n"
             f"- Response urgency: {urgency}.\n"
             f"- Suggested rhythm: {rhythm}.\n"
-            f"- Highest-value missing info: {missing or 'none'}.\n"
-            "- Satisfy latest intent before discovery or CRM.\n"
-            "- Pick one purpose only: direct answer, clarification, small reassurance, recommendation, short explanation, soft transition, or one discovery question.\n"
-            "- Avoid acknowledgement -> statement -> question. Vary the shape naturally.\n"
-            "- If direct question, answer first. If story/concern, respond to the main point without forcing a question.\n"
-            "- Do not ask the missing info unless it naturally follows from the caller's current intent."
+            f"- Useful missing info if it naturally comes up: {missing or 'none'}.\n"
+            "- Customer intent comes before discovery.\n"
+            "- Choose one move only: answer, clarify, reassure, guide, recommend, ask, or close.\n"
+            "- Do not use acknowledgement -> statement -> question.\n"
+            "- Direct question gets a direct answer. Story/concern gets a main-point response.\n"
+            "- Ask missing info only if the caller's current intent is already handled."
         )
+
+    def _sentence_shape_context(self) -> str:
+        latest_user = next(
+            (turn.get("text", "") for turn in reversed(self.transcript_turns) if turn.get("role") == "user"),
+            "",
+        )
+        recent_assistant = [
+            turn["text"]
+            for turn in self.transcript_turns
+            if turn.get("role") == "assistant" and turn.get("text")
+        ][-3:]
+        intent = self._infer_customer_intent(latest_user)
+        shape = self._select_sentence_shape(intent, latest_user, recent_assistant)
+        recent_shapes = [_infer_sentence_shape(text) for text in recent_assistant]
+        avoid = recent_shapes[-1] if recent_shapes else "none"
+        return (
+            "Sentence shape:\n"
+            f"- Use this shape now: {shape}.\n"
+            f"- Avoid last shape: {avoid}.\n"
+            "- Valid shapes: answer only, reaction only, suggestion only, answer + pause, answer + suggestion, question only, answer then stop, tiny reaction then answer.\n"
+            "- Do not use the same shape for 2-3 turns."
+        )
+
+    def _select_sentence_shape(self, intent: str, latest_user: str, recent_assistant: list[str]) -> str:
+        last_shape = _infer_sentence_shape(recent_assistant[-1]) if recent_assistant else ""
+        words = len(str(latest_user or "").split())
+        preferred: list[str]
+        if intent in {"ending conversation", "busy"}:
+            preferred = ["answer then stop", "suggestion only"]
+        elif intent in {"asking information", "asking for clarification", "suspicious"}:
+            preferred = ["tiny reaction then answer", "answer only", "answer + pause"]
+        elif intent == "asking recommendation":
+            preferred = ["answer then stop", "answer + suggestion"]
+        elif intent in {"confused", "thinking", "comparing"}:
+            preferred = ["suggestion only", "answer + pause", "answer only"]
+        elif words <= 2:
+            preferred = ["question only", "reaction only", "answer then stop"]
+        else:
+            preferred = ["answer only", "suggestion only", "question only", "answer + suggestion"]
+        for shape in preferred:
+            if shape != last_shape:
+                return shape
+        return preferred[0]
 
     def _infer_customer_intent(self, text: str) -> str:
         lowered = str(text or "").lower()
@@ -1880,7 +1931,7 @@ class TwilioMediaSession:
             if can_ask(self.customer_memory, field):
                 missing.append((field, label))
         if not missing:
-            return "Smart question selection:\n- No missing high-value field. Do not ask a discovery question unless caller asks."
+            return "Question discipline:\n- No useful discovery question needed right now."
         known_count = sum(
             1
             for field in ("location_interest", "bhk", "property_type", "purpose", "budget", "visit_interest")
@@ -1888,11 +1939,11 @@ class TwilioMediaSession:
         )
         highest = missing[0][1]
         if known_count >= 3 and self.customer_memory.get("visit_interest"):
-            return "Smart question selection:\n- Enough context exists. Continue naturally; do not reopen discovery."
+            return "Question discipline:\n- Enough context exists. Continue naturally; do not reopen discovery."
         return (
-            "Smart question selection:\n"
-            f"- Highest-value missing info: {highest}.\n"
-            "- CRM completion is secondary. Ask it only if the caller's current intent has already been satisfied."
+            "Question discipline:\n"
+            f"- If a question feels natural, the most useful one is about {highest}.\n"
+            "- Skip it if the caller needs an answer, reassurance, or close instead."
         )
 
     def _response_length_context(self) -> str:
@@ -1906,7 +1957,7 @@ class TwilioMediaSession:
         elif words <= 18:
             guidance = "Caller gave a normal reply. Keep response compact and natural."
         else:
-            guidance = "Caller explained more. Acknowledge the main point briefly, then guide."
+            guidance = "Caller explained more. Respond to the main point; don't turn it into an interview."
         return (
             "Response length controller:\n"
             f"- {guidance}\n"
@@ -2462,3 +2513,56 @@ def _first_streamable_fragment(text: str) -> str | None:
 
 def _preview(text: str, limit: int = 600) -> str:
     return " ".join(str(text or "").split())[:limit]
+
+
+def _recent_openings(texts: list[str]) -> list[str]:
+    openings: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        opening = " ".join(str(text or "").strip().split()[:2]).strip(".,!? ").lower()
+        if opening and opening not in seen:
+            openings.append(opening)
+            seen.add(opening)
+    return openings[-6:]
+
+
+def _looks_like_recommendation(text: str) -> bool:
+    lowered = str(text or "").lower()
+    project_terms = ("green valley", "orchid", "lotus", "the greens", "skyline")
+    recommendation_terms = ("option", "dekh sakte", "suit", "fit", "recommend")
+    return any(term in lowered for term in project_terms) and any(term in lowered for term in recommendation_terms)
+
+
+def _infer_sentence_shape(text: str) -> str:
+    cleaned = " ".join(str(text or "").split())
+    lowered = cleaned.lower()
+    if not cleaned:
+        return "unknown"
+    words = cleaned.split()
+    first = words[0].strip(".,!?").lower() if words else ""
+    has_question = "?" in cleaned or lowered.endswith(("kya", "kaise", "kab", "kidhar"))
+    has_reaction = first in {
+        "haan",
+        "hmm",
+        "achha",
+        "theek",
+        "bilkul",
+        "fair",
+        "okay",
+        "dekhiye",
+        "actually",
+    }
+    has_suggestion = any(term in lowered for term in ("dekh sakte", "kar sakte", "bhej deti", "compare", "visit"))
+    if len(words) <= 3 and has_reaction:
+        return "reaction only"
+    if has_question and len(words) <= 9:
+        return "question only"
+    if has_reaction and has_question:
+        return "tiny reaction then question"
+    if has_reaction:
+        return "tiny reaction then answer"
+    if has_suggestion:
+        return "answer + suggestion"
+    if len(words) <= 8:
+        return "answer then stop"
+    return "answer only"

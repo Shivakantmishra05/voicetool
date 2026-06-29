@@ -28,7 +28,10 @@ def get_lead_score_context(memory: dict[str, Any]) -> str:
         status = "warm"
     else:
         status = "early"
-    return f"Lead Score:\n- Score: {score}\n- Priority: {status}\n- If visit intent is present, book visit before asking more questions."
+    return (
+        f"Lead Score:\n- Score: {score}\n- Priority: {status}\n"
+        "- If visit intent is present, confirm one simple next step; do not reopen discovery."
+    )
 
 
 def _positive_visit(value: Any) -> bool:
@@ -38,4 +41,3 @@ def _positive_visit(value: Any) -> bool:
 def _within_30_days(value: Any) -> bool:
     lowered = str(value or "").lower()
     return any(phrase in lowered for phrase in ("immediate", "jaldi", "this month", "within 30", "next month"))
-
