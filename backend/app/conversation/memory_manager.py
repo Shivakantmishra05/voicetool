@@ -38,6 +38,7 @@ DEFAULT_MEMORY: dict[str, Any] = {
     "callback_time": None,
     # Conversation state
     "conversation_stage": "INTRO",
+    "opening_step": None,
     "not_interested_count": 0,
     "intro_delivered": False,
     "objections": [],

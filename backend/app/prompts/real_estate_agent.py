@@ -21,7 +21,7 @@ OUTGOING_CONFIRM_OPTIONS = (
 )
 
 OUTGOING_CONFIRM_LINE = OUTGOING_CONFIRM_OPTIONS[0]
-OUTGOING_CONFIRM_FALLBACK_LINE = "Kya meri baat sir se ho rahi hai?"
+OUTGOING_CONFIRM_FALLBACK_LINE = "Kya meri baat Shivakant Mishra ji se ho rahi hai?"
 
 OPENING_IDENTITY_LINE = "Main Riya bol rahi hoon DreamHome Properties se."
 
