@@ -1785,8 +1785,9 @@ class TwilioMediaSession:
             f"- Suggested rhythm: {rhythm}.\n"
             f"- Highest-value missing info: {missing or 'none'}.\n"
             "- Satisfy latest intent before discovery or CRM.\n"
-            "- Pick one mode only: answer, empathy, clarification, guidance, recommendation, or question.\n"
-            "- If direct question, answer first. If story/concern, acknowledge briefly before guiding.\n"
+            "- Pick one purpose only: direct answer, clarification, small reassurance, recommendation, short explanation, soft transition, or one discovery question.\n"
+            "- Avoid acknowledgement -> statement -> question. Vary the shape naturally.\n"
+            "- If direct question, answer first. If story/concern, respond to the main point without forcing a question.\n"
             "- Do not ask the missing info unless it naturally follows from the caller's current intent."
         )
 
@@ -1841,7 +1842,7 @@ class TwilioMediaSession:
         if len(cleaned.split()) <= 2:
             return "short reply - keep very brief"
         if len(cleaned.split()) >= 22:
-            return "long explanation - acknowledge then guide"
+            return "long explanation - respond to main point, then pause or guide"
         return "normal - concise natural response"
 
     def _infer_response_rhythm(self, text: str, intent: str) -> str:
@@ -1855,7 +1856,7 @@ class TwilioMediaSession:
         if words <= 2:
             return "short"
         if words >= 22:
-            return "brief acknowledgement, then guidance"
+            return "main-point response, then light guidance"
         return "medium conversational"
 
     def _highest_value_missing_field(self) -> str | None:
@@ -1891,7 +1892,7 @@ class TwilioMediaSession:
         )
         highest = missing[0][1]
         if known_count >= 3 and self.customer_memory.get("visit_interest"):
-            return "Smart question selection:\n- Enough context exists. Prefer recommendation/visit confirmation over more discovery."
+            return "Smart question selection:\n- Enough context exists. Continue naturally; do not reopen discovery."
         return (
             "Smart question selection:\n"
             f"- Highest-value missing info: {highest}.\n"

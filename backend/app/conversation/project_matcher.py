@@ -14,7 +14,7 @@ PROJECTS = {
     "orchid_heights": {
         "name": "Orchid Heights",
         "location": "Sector 1 Greater Noida West",
-        "reason": "budget-friendly ready-to-move option hai",
+        "reason": "budget mein ready-to-move dekh sakte hain",
         "prices": {"1 BHK": "25L", "2 BHK": "42L", "3 BHK": "62L"},
     },
     "lotus_residency": {
@@ -26,13 +26,13 @@ PROJECTS = {
     "the_greens": {
         "name": "The Greens",
         "location": "Sector 10 Greater Noida West",
-        "reason": "investment ke liye growth potential better hai",
+        "reason": "us side log investment ke liye bhi dekh rahe hain",
         "prices": {"2 BHK": "48L", "3 BHK": "72L"},
     },
     "skyline_heights": {
         "name": "Skyline Heights",
         "location": "Sector 150 Noida",
-        "reason": "premium Noida location hai",
+        "reason": "Sector 150 Noida side dekh rahe hain to fit ho sakta hai",
         "prices": {"2 BHK": "65L", "3 BHK": "95L"},
     },
 }
@@ -72,19 +72,22 @@ def match_project(memory: dict[str, Any]) -> dict[str, str] | None:
 def project_context(memory: dict[str, Any]) -> str:
     match = match_project(memory)
     confidence = recommendation_confidence(memory, match)
-    if not match:
+    has_minimum_context = _has_minimum_recommendation_context(memory)
+    if not match or confidence < 70 or not has_minimum_context:
         return (
             "Recommendation confidence:\n"
             f"- Score: {confidence}\n"
-            "- Below 70. Do not recommend yet; ask one natural clarification if useful."
+            "- Do not recommend yet. Need location + purpose + BHK or budget first.\n"
+            "- Ask one natural clarification only if it fits the caller's current intent."
         )
     return (
         "Matched project:\n"
         f"- Project: {match['project_name']}\n"
         f"- Reason: {match['reason']}\n"
         f"- Recommendation confidence: {confidence}/100\n"
-        f"- Action: {'Recommend now' if confidence >= 70 else 'Ask one clarification before recommending'}\n"
-        "- Use only this project unless caller explicitly asks for comparison."
+        "- Action: Softly recommend one project.\n"
+        "- Use only this project unless caller explicitly asks for comparison.\n"
+        "- Wording must be soft: 'dekh sakte hain', 'ho sakta hai suit kare', never 'best/perfect'."
     )
 
 
@@ -105,6 +108,13 @@ def recommendation_confidence(memory: dict[str, Any], match: dict[str, str] | No
     if not match:
         return min(score, 65)
     return min(score, 100)
+
+
+def _has_minimum_recommendation_context(memory: dict[str, Any]) -> bool:
+    has_location = bool(memory.get("location_interest") or memory.get("preferred_location"))
+    has_purpose = bool(memory.get("purpose") or memory.get("self_use_or_investment"))
+    has_size_or_budget = bool(memory.get("bhk") or memory.get("property_type") or memory.get("budget"))
+    return has_location and has_purpose and has_size_or_budget
 
 
 def _result(project_key: str, bhk: str) -> dict[str, str]:

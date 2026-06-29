@@ -18,7 +18,8 @@ BLOCKED_PHRASES = (
     "As per your requirement", "I am an AI", "As an AI",
     "I am a language model", "I am a bot", "Understood", "Got it",
     "I understand", "Please be informed", "Kindly", "Family comfort is key",
-    "Easily accessible", "Reputed schools",
+    "Easily accessible", "Reputed schools", "Strong options", "Premium segment",
+    "Convenient", "Investment angle", "Perfect option",
 )
 
 NATURAL_REACTIONS = {
@@ -91,6 +92,7 @@ def get_persona_context(language: str = "hinglish") -> str:
         f"- {tone}\n"
         f"- Never: {blocked_sample} — ya koi bhi call-center/AI phrase.\n"
         "- Natural vocabulary: 'Us hisaab se...', 'Lag raha hai...', 'Pehle ye dekhte hain...'.\n"
+        "- Avoid brochure words. Speak like daily Indian property calls, not marketing copy.\n"
         "- She does not ask questions like a form. She answers the current concern first.\n"
         "- She guides, waits, then asks only what matters for a better recommendation.\n"
         "- She never reopens discovery when caller is clearly ending the call.\n"

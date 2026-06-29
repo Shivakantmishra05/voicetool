@@ -32,8 +32,8 @@ def get_profile_context(memory: dict[str, Any]) -> str:
     profile = memory.get("customer_profile") or "UNKNOWN"
     guidance = {
         "UNKNOWN": "Do light discovery only; do not assume intent yet.",
-        "INVESTOR": "Focus on ROI, future appreciation, connectivity, and location growth.",
-        "SELF_USE": "Focus on family comfort, connectivity, lifestyle, nearby schools and hospitals.",
+        "INVESTOR": "Talk simply about area demand and future use; avoid brochure language.",
+        "SELF_USE": "Talk like a consultant: commute, daily use, and what families generally prefer.",
         "BROKER": "Stay professional, ask for buyer requirement, avoid over-sharing unconfirmed details.",
         "TENANT": "Current inventory is sale-focused; redirect politely to purchase options.",
         "EXPLORING": "Keep discovery light and move toward WhatsApp details or visit.",

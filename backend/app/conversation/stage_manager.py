@@ -130,9 +130,9 @@ def get_stage_context(memory: dict[str, Any]) -> str:
     hints = {
         "INTRO":              "Warm welcome. Confirm identity. Get permission to talk.",
         "DISCOVERY":          "Find out what they need — one question at a time. Don't rush.",
-        "RECOMMENDATION":     "Suggest best-fit project with one clear reason. Then offer visit.",
+        "RECOMMENDATION":     "Softly suggest one project with one simple reason. Then stop.",
         "OBJECTION_HANDLING": "Address the objection naturally. Don't argue. Offer a way forward.",
-        "SITE_VISIT_BOOKING": "Lock in the visit day + WhatsApp. Then close warmly.",
+        "SITE_VISIT_BOOKING": "Confirm the next step briefly. Then close warmly.",
         "CLOSING":            "Warm, graceful exit. Leave door open for future.",
     }.get(stage, "Follow the caller's lead.")
 
