@@ -188,24 +188,18 @@ If not, rewrite internally before speaking.
 
 OUTGOING_CONFIRM_OPTIONS = (
     "Hello... kya meri baat {customer_name} ji se ho rahi hai?",
-    "Namaste, kya main {customer_name} ji se baat kar rahi hoon?",
-    "Hello, {customer_name} ji bol rahe hain?",
-    "{customer_name} ji se baat ho rahi hai?",
-    "Namaste sir, {customer_name} ji available hain?",
 )
 
 OUTGOING_CONFIRM_LINE = OUTGOING_CONFIRM_OPTIONS[0]
 
 OUTGOING_INTRO_OPTIONS = (
-    "Namaste {customer_name} ji. Main Riya bol rahi hoon DreamHome Properties se. Aapki property enquiry kuch din pehle receive hui thi. Abhi do minute baat kar paayenge?",
-    "Namaste {customer_name} ji. DreamHome Properties se Riya bol rahi hoon. Property enquiry ke regarding call kiya tha. Abhi do minute baat ho paayegi?",
-    "Main Riya bol rahi hoon DreamHome Properties se. Aapki property enquiry receive hui thi, usi ke follow-up mein call tha. Abhi do minute hain?",
-    "DreamHome Properties se Riya. Aapki property requirement ke regarding enquiry aayi thi. Abhi short mein baat kar paayenge?",
+    "Namaste {customer_name} ji. Main Riya bol rahi hoon DreamHome Properties se. Aapki property enquiry kuch din pehle receive hui thi, usi ke regarding call kiya tha. Abhi do minute baat kar paayenge?",
 )
 
 OUTGOING_INTRO_LINE = (
-    "Main Riya bol rahi hoon DreamHome Properties se. "
-    "Aapki property enquiry receive hui thi. Abhi do minute baat ho paayegi?"
+    "Namaste sir. Main Riya bol rahi hoon DreamHome Properties se. "
+    "Aapki property enquiry kuch din pehle receive hui thi, usi ke regarding call kiya tha. "
+    "Abhi do minute baat kar paayenge?"
 )
 
 CLOSING_OPTIONS = (
