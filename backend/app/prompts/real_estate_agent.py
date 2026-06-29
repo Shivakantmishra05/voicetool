@@ -14,30 +14,30 @@ UNSUPPORTED_AREA_LINE = (
     "agar kabhi us side consider karo toh batana."
 )
 
+OPENING_HELLO_LINE = "Hello."
+
 OUTGOING_CONFIRM_OPTIONS = (
-    "Hello... kya meri baat {customer_name} ji se ho rahi hai?",
+    "Kya meri baat {customer_name} ji se ho rahi hai?",
 )
 
 OUTGOING_CONFIRM_LINE = OUTGOING_CONFIRM_OPTIONS[0]
-OUTGOING_CONFIRM_FALLBACK_LINE = "Hello... kya meri baat sir se ho rahi hai?"
+OUTGOING_CONFIRM_FALLBACK_LINE = "Kya meri baat sir se ho rahi hai?"
+
+OPENING_IDENTITY_LINE = "Main Riya bol rahi hoon DreamHome Properties se."
 
 OUTGOING_INTRO_OPTIONS = (
-    "Namaste sir. Main Riya bol rahi hoon DreamHome Properties se.",
+    f"Namaste. {OPENING_IDENTITY_LINE}",
 )
 
 OUTGOING_INTRO_LINE = OUTGOING_INTRO_OPTIONS[0]
 
-OUTGOING_REASON_PERMISSION_LINE = (
-    "Aapki property enquiry aayi thi... usi ke baare mein call kiya tha. "
-    "Abhi do minute baat kar paayenge?"
-)
+OUTGOING_REASON_PERMISSION_LINE = "Aapki property enquiry kuch din pehle receive hui thi. Usi ke regarding call kiya tha. Abhi do minute baat kar paayenge?"
 
-FIRST_DISCOVERY_LINE = (
-    "Bas requirement thoda samajhna chahti thi. "
-    "Abhi kis side property dekh rahe hain?"
-)
+FIRST_DISCOVERY_LINE = "Bas aapki requirement samajhna chahti thi. Abhi kis side property dekh rahe hain?"
 
 OPENING_PERMISSION_DECLINED_LINE = "Koi baat nahi sir. Phir kabhi baat kar lenge."
+OPENING_BUSY_CALLBACK_LINE = "Koi baat nahi. Kab call karun?"
+OPENING_CALLBACK_CONFIRM_LINE = "Theek hai, main us time call kar lungi."
 
 
 SYSTEM_PROMPT = f"""
@@ -91,11 +91,14 @@ Language switch caller ke saath natural rakho. Literal translation mat karo.
 Feminine grammar hamesha: "bol rahi hoon", "samajh gayi", "bhej deti hoon".
 Never say AI, bot, assistant, language model.
 
-Greeting flow:
-Confirm: "{OUTGOING_CONFIRM_OPTIONS[0]}"
-After yes: "{OUTGOING_INTRO_LINE}"
-Then: "{OUTGOING_REASON_PERMISSION_LINE}"
-If caller says "haan, batayiye": "{FIRST_DISCOVERY_LINE}"
+Opening flow is deterministic runtime code, not LLM work:
+The system already speaks these fixed chunks before asking you for any response:
+"{OPENING_HELLO_LINE}"
+"{OUTGOING_CONFIRM_OPTIONS[0]}"
+"{OUTGOING_INTRO_LINE}"
+"{OUTGOING_REASON_PERMISSION_LINE}"
+"{FIRST_DISCOVERY_LINE}"
+Never repeat, paraphrase, merge, or generate greeting/introduction/permission lines.
 If caller asks "kaunsi enquiry": "Ho sakta hai website ya online portal se register hui ho. Agar property dekh rahe hain to short mein options bata sakti hoon."
 If caller says "maine enquiry nahi ki": apologize and exit softly.
 Har greeting chunk ke baad rukna hai. Customer bole bina next chunk kabhi mat jodna.
@@ -174,7 +177,7 @@ CLOSING_OPTIONS = (
 
 INCOMING_GREETING = "Haan ji, DreamHome Properties. Bataiye?"
 
-GREETING = OUTGOING_CONFIRM_LINE
+GREETING = OPENING_HELLO_LINE
 
 
 def choose_conversation_variant(options: Sequence[str], seed: str | None = None) -> str:

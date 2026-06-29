@@ -31,11 +31,15 @@ from app.models import Call
 from app.prompts.real_estate_agent import (
     CLOSING_OPTIONS,
     FIRST_DISCOVERY_LINE,
+    OPENING_BUSY_CALLBACK_LINE,
+    OPENING_CALLBACK_CONFIRM_LINE,
+    OPENING_HELLO_LINE,
+    OPENING_IDENTITY_LINE,
+    OPENING_PERMISSION_DECLINED_LINE,
     SYSTEM_PROMPT,
     OUTGOING_CONFIRM_OPTIONS,
     OUTGOING_CONFIRM_FALLBACK_LINE,
-    OUTGOING_INTRO_OPTIONS,
-    OPENING_PERMISSION_DECLINED_LINE,
+    OUTGOING_INTRO_LINE,
     OUTGOING_REASON_PERMISSION_LINE,
     UNSUPPORTED_AREA_LINE,
     build_dynamic_response_context,
@@ -457,11 +461,10 @@ class TwilioMediaSession:
         cartesia_greeting_started = False
         if self._using_cartesia_tts():
             greeting_text = self._greeting_text()
-            if not self._greeting_has_customer_name():
-                self.customer_memory = await self.call_memory.update_memory(
-                    self.state.call_sid,
-                    {"intro_delivered": True, "conversation_stage": "INTRO"},
-                )
+            self.customer_memory = await self.call_memory.update_memory(
+                self.state.call_sid,
+                {"opening_step": "hello_delivered", "conversation_stage": "INTRO"},
+            )
             self._spawn(self._speak_fixed_text(greeting_text, response_id="cartesia-greeting", reason="greeting"), "cartesia_greeting")
             cartesia_greeting_started = True
         self.openai_connect_task = self._spawn(
@@ -576,11 +579,10 @@ class TwilioMediaSession:
         if request_greeting:
             if self._using_cartesia_tts():
                 greeting_text = self._greeting_text()
-                if not self._greeting_has_customer_name():
-                    self.customer_memory = await self.call_memory.update_memory(
-                        self.state.call_sid,
-                        {"intro_delivered": True, "conversation_stage": "INTRO"},
-                    )
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {"opening_step": "hello_delivered", "conversation_stage": "INTRO"},
+                )
                 await self._speak_fixed_text(greeting_text, response_id="cartesia-greeting", reason="greeting")
             else:
                 self.greeting_manager.start("openai-greeting-pending")
@@ -1624,6 +1626,13 @@ class TwilioMediaSession:
         if not self.customer_memory.get("intro_delivered") and self._is_twilio_trial_notice(text):
             log.info("pre_intro_transcript_ignored", reason="twilio_trial_notice")
             return
+        if not self.customer_memory.get("intro_delivered") and self._opening_identity_requested(text):
+            await self._speak_opening_line(
+                OPENING_IDENTITY_LINE,
+                response_id="cartesia-opening-identity-clarification",
+                reason="opening_identity_clarification",
+            )
+            return
         forced_response = self._forced_safety_response(text)
         if forced_response:
             if not self.customer_memory.get("intro_delivered"):
@@ -1649,13 +1658,82 @@ class TwilioMediaSession:
             )
             return
         if not self.customer_memory.get("intro_delivered"):
-            customer_name = (
-                str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
-                or getattr(self.claims, "customer_name", None)
-            )
             self._drop_last_short_user_turn(text, reason="intro_confirmation")
-            opening_step = str(self.customer_memory.get("opening_step") or "confirmed").strip()
-            if opening_step == "confirmed":
+            opening_step = str(self.customer_memory.get("opening_step") or "hello_delivered").strip()
+            if opening_step == "callback_requested":
+                self.close_after_current_response = True
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {
+                        "intro_delivered": True,
+                        "opening_step": "callback_confirmed",
+                        "conversation_stage": "CLOSING",
+                    },
+                )
+                await self._speak_opening_line(
+                    OPENING_CALLBACK_CONFIRM_LINE,
+                    response_id="cartesia-opening-callback-confirmed",
+                    reason="opening_callback_confirmed",
+                )
+                return
+            if self._opening_busy_requested(text):
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {
+                        "callback_requested": True,
+                        "opening_step": "callback_requested",
+                        "conversation_stage": "INTRO",
+                    },
+                )
+                await self._speak_opening_line(
+                    OPENING_BUSY_CALLBACK_LINE,
+                    response_id="cartesia-opening-callback",
+                    reason="opening_busy_callback",
+                )
+                return
+            if self._opening_wrong_number(text):
+                self.close_after_current_response = True
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {
+                        "intro_delivered": True,
+                        "opening_step": "wrong_number",
+                        "conversation_stage": "CLOSING",
+                    },
+                )
+                await self._speak_opening_line(
+                    OPENING_PERMISSION_DECLINED_LINE,
+                    response_id="cartesia-opening-wrong-number",
+                    reason="opening_wrong_number",
+                )
+                return
+            if opening_step == "hello_delivered":
+                self.customer_memory = await self.call_memory.update_memory(
+                    self.state.call_sid,
+                    {
+                        "opening_step": "confirm_asked",
+                        "conversation_stage": "INTRO",
+                    },
+                )
+                await self._speak_opening_line(self._confirm_person_text(), response_id="cartesia-outgoing-confirm", reason="outgoing_confirm")
+                return
+            if opening_step == "confirm_asked":
+                if not _is_opening_affirmative(text):
+                    self.close_after_current_response = True
+                    self.customer_memory = await self.call_memory.update_memory(
+                        self.state.call_sid,
+                        {
+                            "intro_delivered": True,
+                            "opening_step": "person_not_confirmed",
+                            "conversation_stage": "CLOSING",
+                        },
+                    )
+                    await self._speak_opening_line(
+                        OPENING_PERMISSION_DECLINED_LINE,
+                        response_id="cartesia-opening-not-confirmed",
+                        reason="opening_person_not_confirmed",
+                    )
+                    return
                 self.customer_memory = await self.call_memory.update_memory(
                     self.state.call_sid,
                     {
@@ -1663,7 +1741,7 @@ class TwilioMediaSession:
                         "conversation_stage": "INTRO",
                     },
                 )
-                await self._speak_opening_line(self._outgoing_intro_text(), response_id="cartesia-outgoing-intro", reason="outgoing_intro")
+                await self._speak_opening_line(OUTGOING_INTRO_LINE, response_id="cartesia-outgoing-intro", reason="outgoing_intro")
                 return
             if opening_step == "identity_delivered":
                 self.customer_memory = await self.call_memory.update_memory(
@@ -1679,7 +1757,7 @@ class TwilioMediaSession:
                     reason="outgoing_permission",
                 )
                 return
-            if not _is_opening_affirmative(text):
+            if opening_step == "permission_asked" and not _is_opening_affirmative(text):
                 self.close_after_current_response = True
                 self.customer_memory = await self.call_memory.update_memory(
                     self.state.call_sid,
@@ -1694,6 +1772,9 @@ class TwilioMediaSession:
                     response_id="cartesia-opening-declined",
                     reason="opening_permission_declined",
                 )
+                return
+            if opening_step != "permission_asked":
+                log.warning("opening_step_unknown", opening_step=opening_step)
                 return
             self.customer_memory = await self.call_memory.update_memory(
                 self.state.call_sid,
@@ -1724,6 +1805,31 @@ class TwilioMediaSession:
             reason=reason,
             force=True,
         )
+
+    def _confirm_person_text(self) -> str:
+        customer_name = (
+            str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
+            or getattr(self.claims, "customer_name", None)
+        )
+        if not customer_name:
+            return OUTGOING_CONFIRM_FALLBACK_LINE
+        seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:confirm"
+        return choose_conversation_variant(OUTGOING_CONFIRM_OPTIONS, seed).format(customer_name=customer_name)
+
+    @staticmethod
+    def _opening_identity_requested(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(term in lowered for term in ("kaun bol", "kon bol", "kaun ho", "who is this", "who are you"))
+
+    @staticmethod
+    def _opening_busy_requested(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(term in lowered for term in ("busy", "abhi nahi", "baad mein", "bad mein", "later", "meeting", "free nahi"))
+
+    @staticmethod
+    def _opening_wrong_number(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(term in lowered for term in ("wrong number", "galat number", "गलत नंबर"))
 
     def _first_discovery_text(self) -> str:
         if can_ask(self.customer_memory, "location_interest"):
@@ -2046,23 +2152,10 @@ class TwilioMediaSession:
         return "trial account" in lowered or "remove this message" in lowered
 
     def _greeting_text(self) -> str:
-        customer_name = (
-            str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
-            or getattr(self.claims, "customer_name", None)
-        )
-        if not customer_name:
-            return OUTGOING_CONFIRM_FALLBACK_LINE
-        seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:greeting"
-        return choose_conversation_variant(OUTGOING_CONFIRM_OPTIONS, seed).format(customer_name=customer_name)
+        return OPENING_HELLO_LINE
 
     def _outgoing_intro_text(self) -> str:
-        seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:intro"
-        customer_name = (
-            str(self.customer_memory.get("customer_name") or self.customer_memory.get("name") or "").strip()
-            or getattr(self.claims, "customer_name", None)
-            or "sir"
-        )
-        return choose_conversation_variant(OUTGOING_INTRO_OPTIONS, seed).format(customer_name=customer_name)
+        return OUTGOING_INTRO_LINE
 
     def _closing_text(self, reason: str) -> str:
         seed = f"{self.state.call_sid if self.state else self.claims.call_sid}:{reason}:closing"
@@ -2075,7 +2168,7 @@ class TwilioMediaSession:
         )
 
     def _build_greeting_instructions(self) -> str:
-        confirm_line = self._greeting_text()
+        confirm_line = OPENING_HELLO_LINE
         instructions = (
             "Say exactly this one line in a warm, natural Indian phone-call tone, then stop "
             "and wait for the caller to respond. Do not add anything else:\n"
@@ -2391,6 +2484,19 @@ class TwilioMediaSession:
         self.transcript_turns.append({"role": role, "text": cleaned})
         log.info("transcript_accumulated", role=role, chars=len(cleaned), turns=len(self.transcript_turns))
         return True
+
+    def _drop_last_short_user_turn(self, text: str, *, reason: str) -> None:
+        if len(str(text or "").strip()) > 18 or not self.transcript_turns:
+            return
+        last_turn = self.transcript_turns[-1]
+        if str(last_turn.get("role") or "").lower() != "user":
+            return
+        removed = self.transcript_turns.pop()
+        log.info(
+            "short_intro_confirmation_removed_from_prompt",
+            reason=reason,
+            chars=len(str(removed.get("text") or "")),
+        )
 
     def _full_transcript(self) -> str:
         lines = [f"{turn['role'].title()}: {turn['text']}" for turn in self.transcript_turns]
